@@ -1,1 +1,2 @@
 a4f8dbacee5ddb424ea9e0cca5968a29ce54abed58c849f6a6317670a91f6e3f  DarksidersGenesis_PreOrderMounts_P.pak
+903dd696559f7b60d1a3721851aabbf13bbeb639a1ff77537d02a0243ecd2576  DarksidersGenesis_PreOrderMounts_v1.0.0.zip
