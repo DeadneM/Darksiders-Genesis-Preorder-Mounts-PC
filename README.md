@@ -1,3 +1,5 @@
+![Darksiders Genesis Pre-Order Mounts PC Banner](docs/images/Image ChatGPT 3 oct. 2026, 19_39_47.png)
+
 # Darksiders Genesis – Pre-Order Mounts PC Unlocker
 
 Unlocks the two console pre-order horse skins in the PC version of **Darksiders Genesis**:
