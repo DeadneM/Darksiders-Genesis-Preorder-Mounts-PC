@@ -447,7 +447,7 @@ struct Config {
 
 Config g_config;
 
-BYTE* FindPatternInMainModule(const int* pattern, size_t patternLength) {
+BYTE* FindPatternInMainModuleText(const int* pattern, size_t patternLength) {
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module || !pattern || patternLength == 0) {
         return nullptr;
@@ -460,26 +460,38 @@ BYTE* FindPatternInMainModule(const int* pattern, size_t patternLength) {
     }
 
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         return nullptr;
     }
 
-    const size_t imageSize = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
-    if (imageSize < patternLength) {
-        return nullptr;
-    }
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD sectionIndex = 0; sectionIndex < nt->FileHeader.NumberOfSections; ++sectionIndex) {
+        const IMAGE_SECTION_HEADER& section = sections[sectionIndex];
+        if (memcmp(section.Name, ".text", 5) != 0) {
+            continue;
+        }
 
-    for (size_t i = 0; i <= imageSize - patternLength; ++i) {
-        bool match = true;
-        for (size_t j = 0; j < patternLength; ++j) {
-            if (pattern[j] >= 0 && base[i + j] != static_cast<BYTE>(pattern[j])) {
-                match = false;
-                break;
+        BYTE* start = base + section.VirtualAddress;
+        const size_t sectionSize = static_cast<size_t>(section.Misc.VirtualSize);
+        if (sectionSize < patternLength) {
+            return nullptr;
+        }
+
+        for (size_t i = 0; i <= sectionSize - patternLength; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < patternLength; ++j) {
+                if (pattern[j] >= 0 && start[i + j] != static_cast<BYTE>(pattern[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return start + i;
             }
         }
-        if (match) {
-            return base + i;
-        }
+
+        return nullptr;
     }
 
     return nullptr;
@@ -501,7 +513,7 @@ bool ResolveIntroCVarDataSlot() {
         0x33, 0xD2
     };
 
-    BYTE* hit = FindPatternInMainModule(kPattern, ARRAYSIZE(kPattern));
+    BYTE* hit = FindPatternInMainModuleText(kPattern, ARRAYSIZE(kPattern));
     if (!hit) {
         g_introCVarResolved.store(true);
         Log("SkipIntro: signature NOT FOUND; feature stays fail-open");
@@ -546,12 +558,20 @@ bool ApplySkipIntroSetting() {
     }
 
     MEMORY_BASIC_INFORMATION mbi{};
+    const DWORD protection = mbi.Protect & 0xFF;
+    const bool writable =
+        protection == PAGE_READWRITE ||
+        protection == PAGE_WRITECOPY ||
+        protection == PAGE_EXECUTE_READWRITE ||
+        protection == PAGE_EXECUTE_WRITECOPY;
+
     if (VirtualQuery(data, &mbi, sizeof(mbi)) != sizeof(mbi) ||
         mbi.State != MEM_COMMIT ||
         (mbi.Protect & PAGE_GUARD) != 0 ||
-        (mbi.Protect & PAGE_NOACCESS) != 0) {
+        (mbi.Protect & PAGE_NOACCESS) != 0 ||
+        !writable) {
         g_introCVarApplied.store(false);
-        Log("SkipIntro: CVar data pointer failed memory validation");
+        Log("SkipIntro: CVar data pointer failed writable-memory validation");
         return false;
     }
 
