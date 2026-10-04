@@ -21,7 +21,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace {
 
-constexpr const char* kBuild = "0.3A-toggle-hud-test";
+constexpr const char* kBuild = "0.4A-movement-speed-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -32,10 +32,12 @@ std::wstring g_logPath;
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using HudHiddenGetterFn = bool(*)();
+using CharacterGetMaxSpeedFn = float(*)(void*);
 
 PresentFn g_originalPresent = nullptr;
 ResizeBuffersFn g_originalResizeBuffers = nullptr;
 HudHiddenGetterFn g_originalHudHiddenGetter = nullptr;
+CharacterGetMaxSpeedFn g_originalCharacterGetMaxSpeed = nullptr;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -50,6 +52,7 @@ std::atomic_bool g_captureMenuKey{false};
 std::atomic_int g_capturedMenuKey{0};
 std::atomic_bool g_hudHidden{false};
 std::atomic_bool g_hudHookReady{false};
+std::atomic_bool g_movementHookReady{false};
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -637,6 +640,203 @@ bool HookHudHiddenGetter() {
     return nativeHidden || g_hudHidden.load();
 }
 
+BYTE* FindAsciiString(const PeSectionView& section, const char* text) {
+    if (!text) {
+        return nullptr;
+    }
+
+    const size_t bytes = strlen(text) + 1;
+    return FindBytes(section, reinterpret_cast<const BYTE*>(text), bytes);
+}
+
+bool AddressInSection(const PeSectionView& section, const void* address) {
+    const BYTE* p = reinterpret_cast<const BYTE*>(address);
+    return section.begin && p >= section.begin && p < section.begin + section.size;
+}
+
+BYTE* ResolveCharacterGetMaxSpeedNative() {
+    PeSectionView text{};
+    PeSectionView rdata{};
+    if (!GetMainModuleSection(".text", text) ||
+        !GetMainModuleSection(".rdata", rdata)) {
+        Log("Movement hook: failed to enumerate PE sections");
+        return nullptr;
+    }
+
+    BYTE* maxSpeedName = FindAsciiString(rdata, "GetMaxSpeed");
+    BYTE* movementGetterName = FindAsciiString(rdata, "GetMayhemMovementComponent");
+    if (!maxSpeedName || !movementGetterName) {
+        Log("Movement hook: required Mayhem function names not found");
+        return nullptr;
+    }
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const uintptr_t maxSpeedVA = reinterpret_cast<uintptr_t>(maxSpeedName);
+    const uintptr_t movementGetterVA = reinterpret_cast<uintptr_t>(movementGetterName);
+
+    BYTE* execWrapper = nullptr;
+    size_t execCandidates = 0;
+
+    for (size_t i = 0; i + 32 <= rdata.size; i += sizeof(uintptr_t)) {
+        BYTE* p = rdata.begin + i;
+        const uintptr_t name0 = *reinterpret_cast<const uintptr_t*>(p);
+        const uintptr_t func0 = *reinterpret_cast<const uintptr_t*>(p + 8);
+        const uintptr_t name1 = *reinterpret_cast<const uintptr_t*>(p + 16);
+
+        if (name0 != maxSpeedVA || name1 != movementGetterVA) {
+            continue;
+        }
+
+        BYTE* candidate = reinterpret_cast<BYTE*>(func0);
+        if (!AddressInSection(text, candidate)) {
+            continue;
+        }
+
+        // The native exec wrapper for AMayhemCharacter::GetMaxSpeed starts with
+        // push rbx / sub rsp,20h and contains one rel32 call to the real helper.
+        if (candidate[0] == 0x40 &&
+            candidate[1] == 0x53 &&
+            candidate[2] == 0x48 &&
+            candidate[3] == 0x83 &&
+            candidate[4] == 0xEC &&
+            candidate[5] == 0x20) {
+            execWrapper = candidate;
+            ++execCandidates;
+        }
+    }
+
+    if (execCandidates != 1 || !execWrapper) {
+        Log("Movement hook: GetMaxSpeed exec-wrapper match count=%zu", execCandidates);
+        return nullptr;
+    }
+
+    BYTE* nativeTarget = nullptr;
+    size_t callCount = 0;
+    for (size_t i = 0; i < 48; ++i) {
+        if (execWrapper[i] != 0xE8) {
+            continue;
+        }
+
+        const int32_t rel = *reinterpret_cast<const int32_t*>(execWrapper + i + 1);
+        BYTE* target = execWrapper + i + 5 + rel;
+        if (!AddressInSection(text, target)) {
+            continue;
+        }
+
+        static constexpr BYTE kExpectedPrefix[] = {
+            0x48, 0x8B, 0x89, 0x20, 0x0A, 0x00, 0x00,
+            0x48, 0x85, 0xC9
+        };
+
+        if (memcmp(target, kExpectedPrefix, sizeof(kExpectedPrefix)) == 0) {
+            nativeTarget = target;
+            ++callCount;
+        }
+    }
+
+    if (callCount != 1 || !nativeTarget) {
+        Log("Movement hook: native GetMaxSpeed target match count=%zu", callCount);
+        return nullptr;
+    }
+
+    Log(
+        "Movement hook: AMayhemCharacter::GetMaxSpeed resolved execRVA=0x%zX nativeRVA=0x%zX",
+        static_cast<size_t>(execWrapper - base),
+        static_cast<size_t>(nativeTarget - base)
+    );
+
+    return nativeTarget;
+}
+
+bool IsLocallyControlledMayhemCharacter(void* character) {
+    if (!character) {
+        return false;
+    }
+
+    void** vtable = *reinterpret_cast<void***>(character);
+    if (!vtable) {
+        return false;
+    }
+
+    // APawn::IsLocallyControlled virtual slot in the audited UE4 build.
+    // Reflection wrapper audit resolves to call qword ptr [vtable + 0x680].
+    using IsLocallyControlledFn = bool(*)(void*);
+    auto fn = reinterpret_cast<IsLocallyControlledFn>(vtable[0x680 / sizeof(void*)]);
+    if (!fn) {
+        return false;
+    }
+
+    return fn(character);
+}
+
+bool IsHorseActiveForPlayer(void* character) {
+    if (!character) {
+        return false;
+    }
+
+    // AMayhemPlayerCharacter::IsHorseActive reflection wrapper:
+    // cmp qword ptr [rcx + 0xE70], 0
+    return *reinterpret_cast<void**>(reinterpret_cast<BYTE*>(character) + 0xE70) != nullptr;
+}
+
+float HookCharacterGetMaxSpeed(void* character) {
+    const float nativeSpeed = g_originalCharacterGetMaxSpeed
+        ? g_originalCharacterGetMaxSpeed(character)
+        : 0.0f;
+
+    if (!g_config.movementSpeedEnabled ||
+        nativeSpeed <= 0.0f ||
+        !IsLocallyControlledMayhemCharacter(character) ||
+        IsHorseActiveForPlayer(character)) {
+        return nativeSpeed;
+    }
+
+    float multiplier = g_config.movementSpeedMultiplier;
+    if (multiplier < 0.10f) multiplier = 0.10f;
+    if (multiplier > 5.00f) multiplier = 5.00f;
+
+    return nativeSpeed * multiplier;
+}
+
+bool InstallMovementSpeedHook() {
+    BYTE* target = ResolveCharacterGetMaxSpeedNative();
+    if (!target) {
+        Log("Movement hook: resolver failed; feature remains fail-open");
+        return false;
+    }
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("Movement hook: MinHook initialize FAILED status=%d", static_cast<int>(initStatus));
+        return false;
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        target,
+        reinterpret_cast<LPVOID>(&HookCharacterGetMaxSpeed),
+        reinterpret_cast<LPVOID*>(&g_originalCharacterGetMaxSpeed)
+    );
+
+    if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+        Log("Movement hook: create FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    status = MH_EnableHook(target);
+    if (status != MH_OK && status != MH_ERROR_ENABLED) {
+        Log("Movement hook: enable FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    g_movementHookReady.store(true);
+    Log(
+        "Movement hook: READY multiplier=%.3fx player-only=1 horse-excluded=1",
+        g_config.movementSpeedMultiplier
+    );
+    return true;
+}
+
 bool InstallHudHook() {
     BYTE* getter = ResolveHudHiddenGetter();
     if (!getter) {
@@ -723,6 +923,26 @@ void TriggerAction(Action action, int functionKey) {
         g_hudHidden.store(hidden);
         g_lastAction = std::string("HUD ") + (hidden ? "hidden" : "visible");
         Log("F%d -> HUD %s", functionKey, hidden ? "HIDDEN" : "VISIBLE");
+        return;
+    }
+
+    if (action == Action::MovementSpeed) {
+        if (!g_movementHookReady.load()) {
+            g_lastAction = "Movement Speed [hook unavailable]";
+            Log("F%d -> Movement Speed ignored (native hook unavailable)", functionKey);
+            return;
+        }
+
+        g_config.movementSpeedEnabled = !g_config.movementSpeedEnabled;
+        g_config.Save();
+        g_lastAction = std::string("Movement Speed ") +
+            (g_config.movementSpeedEnabled ? "ON" : "OFF");
+        Log(
+            "F%d -> Movement Speed %s multiplier=%.3fx",
+            functionKey,
+            g_config.movementSpeedEnabled ? "ON" : "OFF",
+            g_config.movementSpeedMultiplier
+        );
         return;
     }
 
@@ -995,9 +1215,9 @@ void DrawOverlay() {
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextWrapped(
-                "V0.3 keeps the validated overlay foundation and rebindable menu key, then adds "
-                "the first native gameplay feature: Toggle HUD through the game's own ui.HideHud "
-                "getter. No HUD memory value is overwritten and native hide requests are preserved."
+                "V0.4 is cumulative: validated overlay foundation, rebindable menu key, native "
+                "Toggle HUD, plus player-only Movement Speed. The movement multiplier hooks the "
+                "game's AMayhemCharacter::GetMaxSpeed helper and explicitly excludes horseback."
             );
             ImGui::EndTabItem();
         }
@@ -1028,11 +1248,34 @@ void DrawOverlay() {
                 ImGui::TextDisabled("F1 default");
                 ImGui::Unindent();
             }
-            DrawFeatureRow("Movement Speed", &g_config.movementSpeedEnabled, "Hook pending");
+            if (ImGui::Checkbox("Movement Speed", &g_config.movementSpeedEnabled)) {
+                g_config.Save();
+                g_lastAction = std::string("Movement Speed ") +
+                    (g_config.movementSpeedEnabled ? "ON" : "OFF");
+            }
+            ImGui::SameLine(260.0f);
+            ImGui::TextDisabled(
+                "%s",
+                g_movementHookReady.load()
+                    ? "Player-only native GetMaxSpeed hook"
+                    : "Native hook unavailable"
+            );
+
             if (g_config.movementSpeedEnabled) {
                 ImGui::Indent();
                 ImGui::SetNextItemWidth(260.0f);
-                ImGui::SliderFloat("Multiplier##Movement", &g_config.movementSpeedMultiplier, 1.00f, 2.50f, "%.2fx");
+                if (ImGui::SliderFloat(
+                    "Multiplier##Movement",
+                    &g_config.movementSpeedMultiplier,
+                    1.00f,
+                    2.50f,
+                    "%.2fx"
+                )) {
+                    g_config.Save();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("F2 toggles");
+                ImGui::TextDisabled("On-foot only; horse speed is intentionally excluded.");
                 ImGui::Unindent();
             }
 
@@ -1048,7 +1291,9 @@ void DrawOverlay() {
             DrawFeatureRow("Third Person", &g_config.thirdPersonEnabled, "Camera hook pending");
 
             ImGui::Spacing();
-            ImGui::TextDisabled("Toggle HUD is native in V0.3; remaining gameplay features are still pending.");
+            ImGui::TextDisabled(
+                "Toggle HUD and on-foot Movement Speed are native; remaining gameplay features are pending."
+            );
             ImGui::EndTabItem();
         }
 
@@ -1115,9 +1360,9 @@ void DrawOverlay() {
             ImGui::TextWrapped("Size: 62,113,280 bytes");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Toggle HUD uses the game's native ui.HideHud path. The ASI resolves the CVar by "
-                "its UTF-16 name, follows its registration data slot, identifies the unique boolean "
-                "getter, and hooks that getter without modifying the CVar itself."
+                "Toggle HUD uses the game's native ui.HideHud path. Movement Speed resolves the "
+                "Mayhem GetMaxSpeed reflection registration, follows its native exec wrapper to "
+                "AMayhemCharacter::GetMaxSpeed, and multiplies only locally controlled on-foot players."
             );
             ImGui::EndTabItem();
         }
@@ -1375,6 +1620,10 @@ DWORD WINAPI MainThread(LPVOID) {
 
     if (!InstallHudHook()) {
         Log("Toggle HUD unavailable; renderer/input core remains active.");
+    }
+
+    if (!InstallMovementSpeedHook()) {
+        Log("Movement Speed unavailable; other ASI features remain active.");
     }
 
     Log("Core initialization complete. Press %s after the first game frame.",
