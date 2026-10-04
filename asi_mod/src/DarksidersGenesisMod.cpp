@@ -13,13 +13,15 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <array>
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
 namespace {
 
-constexpr const char* kBuild = "0.2A-rebind-only-test";
+constexpr const char* kBuild = "0.3A-toggle-hud-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -29,9 +31,11 @@ std::wstring g_logPath;
 
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using HudHiddenGetterFn = bool(*)();
 
 PresentFn g_originalPresent = nullptr;
 ResizeBuffersFn g_originalResizeBuffers = nullptr;
+HudHiddenGetterFn g_originalHudHiddenGetter = nullptr;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -44,6 +48,8 @@ std::atomic_bool g_imguiReady{false};
 std::atomic_bool g_overlayVisible{false};
 std::atomic_bool g_captureMenuKey{false};
 std::atomic_int g_capturedMenuKey{0};
+std::atomic_bool g_hudHidden{false};
+std::atomic_bool g_hudHookReady{false};
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -443,6 +449,229 @@ struct Config {
 
 Config g_config;
 
+struct PeSectionView {
+    BYTE* begin = nullptr;
+    size_t size = 0;
+};
+
+bool GetMainModuleSection(const char* sectionName, PeSectionView& out) {
+    out = {};
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module || !sectionName) {
+        return false;
+    }
+
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        char name[9]{};
+        memcpy(name, sections[i].Name, 8);
+        if (strcmp(name, sectionName) == 0) {
+            out.begin = base + sections[i].VirtualAddress;
+            out.size = static_cast<size_t>(sections[i].Misc.VirtualSize);
+            return out.begin != nullptr && out.size != 0;
+        }
+    }
+
+    return false;
+}
+
+BYTE* FindBytes(const PeSectionView& section, const BYTE* bytes, size_t length) {
+    if (!section.begin || !bytes || length == 0 || section.size < length) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i <= section.size - length; ++i) {
+        if (memcmp(section.begin + i, bytes, length) == 0) {
+            return section.begin + i;
+        }
+    }
+
+    return nullptr;
+}
+
+BYTE* FindWideString(const PeSectionView& section, const wchar_t* text) {
+    if (!text) {
+        return nullptr;
+    }
+
+    const size_t bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    return FindBytes(section, reinterpret_cast<const BYTE*>(text), bytes);
+}
+
+BYTE* FindRipRelativeLeaTo(const PeSectionView& text, BYTE* target) {
+    if (!text.begin || !target || text.size < 7) {
+        return nullptr;
+    }
+
+    BYTE* match = nullptr;
+    size_t count = 0;
+
+    for (size_t i = 0; i <= text.size - 7; ++i) {
+        BYTE* p = text.begin + i;
+
+        // lea rdx,[rip+disp32] is the exact registration reference used by
+        // ui.HideHud in the audited Darksiders Genesis executable.
+        if (p[0] != 0x48 || p[1] != 0x8D || p[2] != 0x15) {
+            continue;
+        }
+
+        const int32_t disp = *reinterpret_cast<const int32_t*>(p + 3);
+        BYTE* resolved = p + 7 + disp;
+        if (resolved == target) {
+            match = p;
+            ++count;
+        }
+    }
+
+    return count == 1 ? match : nullptr;
+}
+
+BYTE* ResolveHudHiddenGetter() {
+    PeSectionView text{};
+    PeSectionView rdata{};
+    if (!GetMainModuleSection(".text", text) ||
+        !GetMainModuleSection(".rdata", rdata)) {
+        Log("HUD hook: failed to enumerate PE sections");
+        return nullptr;
+    }
+
+    BYTE* cvarName = FindWideString(rdata, L"ui.HideHud");
+    if (!cvarName) {
+        Log("HUD hook: ui.HideHud string not found");
+        return nullptr;
+    }
+
+    BYTE* nameXref = FindRipRelativeLeaTo(text, cvarName);
+    if (!nameXref) {
+        Log("HUD hook: unique ui.HideHud registration xref not found");
+        return nullptr;
+    }
+
+    // Audited registration sequence:
+    //   lea rdx,[rip+ui.HideHud]
+    //   call qword ptr [rax+10h]
+    //   mov [rip+ConsoleVariableObject],rax
+    //   ...
+    //   call qword ptr [rdx+38h]
+    //   mov [rip+ConsoleVariableData],rax
+    //
+    // The final MOV begins exactly 40 bytes after the LEA in this executable.
+    BYTE* dataStore = nameXref + 40;
+    if (dataStore + 7 > text.begin + text.size ||
+        dataStore[0] != 0x48 ||
+        dataStore[1] != 0x89 ||
+        dataStore[2] != 0x05) {
+        Log("HUD hook: ui.HideHud registration layout mismatch");
+        return nullptr;
+    }
+
+    const int32_t slotDisp = *reinterpret_cast<const int32_t*>(dataStore + 3);
+    BYTE* dataSlot = dataStore + 7 + slotDisp;
+
+    BYTE* getter = nullptr;
+    size_t getterCount = 0;
+
+    for (size_t i = 0; i + 14 <= text.size; ++i) {
+        BYTE* p = text.begin + i;
+        if (p[0] != 0x48 || p[1] != 0x8B || p[2] != 0x05) {
+            continue;
+        }
+
+        const int32_t disp = *reinterpret_cast<const int32_t*>(p + 3);
+        BYTE* resolved = p + 7 + disp;
+        if (resolved != dataSlot) {
+            continue;
+        }
+
+        static constexpr BYTE tail[] = {
+            0x83, 0x38, 0x00,
+            0x0F, 0x95, 0xC0,
+            0xC3
+        };
+
+        if (memcmp(p + 7, tail, sizeof(tail)) == 0) {
+            getter = p;
+            ++getterCount;
+        }
+    }
+
+    if (getterCount != 1 || !getter) {
+        Log("HUD hook: ui.HideHud getter match count=%zu", getterCount);
+        return nullptr;
+    }
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    Log(
+        "HUD hook: ui.HideHud resolved nameRVA=0x%zX slotRVA=0x%zX getterRVA=0x%zX",
+        static_cast<size_t>(cvarName - base),
+        static_cast<size_t>(dataSlot - base),
+        static_cast<size_t>(getter - base)
+    );
+
+    return getter;
+}
+
+bool HookHudHiddenGetter() {
+    const bool nativeHidden = g_originalHudHiddenGetter
+        ? g_originalHudHiddenGetter()
+        : false;
+
+    if (!g_config.toggleHudEnabled) {
+        return nativeHidden;
+    }
+
+    return nativeHidden || g_hudHidden.load();
+}
+
+bool InstallHudHook() {
+    BYTE* getter = ResolveHudHiddenGetter();
+    if (!getter) {
+        Log("HUD hook: resolver failed; feature remains fail-open");
+        return false;
+    }
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("HUD hook: MinHook initialize FAILED status=%d", static_cast<int>(initStatus));
+        return false;
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        getter,
+        reinterpret_cast<LPVOID>(&HookHudHiddenGetter),
+        reinterpret_cast<LPVOID*>(&g_originalHudHiddenGetter)
+    );
+
+    if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+        Log("HUD hook: create FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    status = MH_EnableHook(getter);
+    if (status != MH_OK && status != MH_ERROR_ENABLED) {
+        Log("HUD hook: enable FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    g_hudHookReady.store(true);
+    Log("HUD hook: READY; mod state starts visible and preserves native hidden state");
+    return true;
+}
+
 bool IsFeatureEnabled(Action action) {
     switch (action) {
     case Action::ToggleHUD:
@@ -480,6 +709,20 @@ void TriggerAction(Action action, int functionKey) {
     if (!IsFeatureEnabled(action)) {
         g_lastAction = std::string(label) + " disabled in config";
         Log("F%d -> %s ignored (feature disabled)", functionKey, label);
+        return;
+    }
+
+    if (action == Action::ToggleHUD) {
+        if (!g_hudHookReady.load()) {
+            g_lastAction = "Toggle HUD [hook unavailable]";
+            Log("F%d -> Toggle HUD ignored (native hook unavailable)", functionKey);
+            return;
+        }
+
+        const bool hidden = !g_hudHidden.load();
+        g_hudHidden.store(hidden);
+        g_lastAction = std::string("HUD ") + (hidden ? "hidden" : "visible");
+        Log("F%d -> HUD %s", functionKey, hidden ? "HIDDEN" : "VISIBLE");
         return;
     }
 
@@ -745,16 +988,16 @@ void DrawOverlay() {
             ImGui::SameLine();
             if (ImGui::Button("Reset Defaults", ImVec2(140.0f, 0.0f))) {
                 g_config.ResetDefaults(true);
+                g_hudHidden.store(false);
                 g_lastAction = "Defaults restored";
             }
 
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextWrapped(
-                "V0.2 keeps the validated V0.1 overlay foundation and adds a fully rebindable "
-                "menu key with immediate INI persistence. Gameplay hooks are deliberately not "
-                "pretended: each planned feature is enabled by default but marked pending "
-                "until its game-native implementation is verified."
+                "V0.3 keeps the validated overlay foundation and rebindable menu key, then adds "
+                "the first native gameplay feature: Toggle HUD through the game's own ui.HideHud "
+                "getter. No HUD memory value is overwritten and native hide requests are preserved."
             );
             ImGui::EndTabItem();
         }
@@ -764,7 +1007,27 @@ void DrawOverlay() {
             ImGui::Text("Default policy: all requested features are enabled.");
             ImGui::Spacing();
 
-            DrawFeatureRow("Toggle HUD", &g_config.toggleHudEnabled, "Hook pending");
+            ImGui::Checkbox("Toggle HUD", &g_config.toggleHudEnabled);
+            ImGui::SameLine(260.0f);
+            ImGui::TextDisabled(
+                "%s",
+                g_hudHookReady.load()
+                    ? "Native ui.HideHud getter hooked"
+                    : "Native hook unavailable"
+            );
+
+            if (g_config.toggleHudEnabled) {
+                bool hudHidden = g_hudHidden.load();
+                ImGui::Indent();
+                if (ImGui::Checkbox("HUD Hidden##RuntimeHUD", &hudHidden)) {
+                    g_hudHidden.store(hudHidden);
+                    g_lastAction = std::string("HUD ") + (hudHidden ? "hidden" : "visible");
+                    Log("Overlay -> HUD %s", hudHidden ? "HIDDEN" : "VISIBLE");
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("F1 default");
+                ImGui::Unindent();
+            }
             DrawFeatureRow("Movement Speed", &g_config.movementSpeedEnabled, "Hook pending");
             if (g_config.movementSpeedEnabled) {
                 ImGui::Indent();
@@ -785,7 +1048,7 @@ void DrawOverlay() {
             DrawFeatureRow("Third Person", &g_config.thirdPersonEnabled, "Camera hook pending");
 
             ImGui::Spacing();
-            ImGui::TextDisabled("Values above are stored now; gameplay application arrives feature-by-feature.");
+            ImGui::TextDisabled("Toggle HUD is native in V0.3; remaining gameplay features are still pending.");
             ImGui::EndTabItem();
         }
 
@@ -852,9 +1115,9 @@ void DrawOverlay() {
             ImGui::TextWrapped("Size: 62,113,280 bytes");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "The executable imports DXGI and D3D11 directly. It also contains UE4 MoviePlayer "
-                "symbols including StartupMovies and WindowsMoviePlayer, which is the active lead "
-                "for the intro-video feature."
+                "Toggle HUD uses the game's native ui.HideHud path. The ASI resolves the CVar by "
+                "its UTF-16 name, follows its registration data slot, identifies the unique boolean "
+                "getter, and hooks that getter without modifying the CVar itself."
             );
             ImGui::EndTabItem();
         }
@@ -1110,7 +1373,12 @@ DWORD WINAPI MainThread(LPVOID) {
         return 0;
     }
 
-    Log("Core initialization complete. Press Insert after the first game frame.");
+    if (!InstallHudHook()) {
+        Log("Toggle HUD unavailable; renderer/input core remains active.");
+    }
+
+    Log("Core initialization complete. Press %s after the first game frame.",
+        KeyDisplayName(g_config.menuKey).c_str());
     return 0;
 }
 
