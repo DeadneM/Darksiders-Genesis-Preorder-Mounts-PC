@@ -1083,6 +1083,12 @@ void TriggerAction(Action action, int functionKey) {
     const char* label = ActionLabel(action);
 
     if (action == Action::ToggleHUD) {
+        if (!g_config.toggleHudEnabled) {
+            g_lastAction = "Toggle HUD disabled in config";
+            Log("F%d -> Toggle HUD ignored (feature disabled)", functionKey);
+            return;
+        }
+
         if (!g_hudHookReady.load()) {
             g_lastAction = "Toggle HUD [hook unavailable]";
             Log("F%d -> Toggle HUD ignored (native hook unavailable)", functionKey);
