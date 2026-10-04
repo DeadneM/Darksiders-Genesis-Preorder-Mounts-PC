@@ -84,7 +84,79 @@ This gives the Skip Intro feature a real engine-native investigation path.
 
 ---
 
-## V0.2A — Rebindable menu key / safe rollback
+## V0.3A — Native Toggle HUD
+
+**Status: TEST CANDIDATE**
+
+V0.3A is cumulative from V0.2A:
+
+- validated V0.1 DXGI / D3D11 / ImGui overlay foundation;
+- rebindable overlay menu key;
+- first real gameplay feature: native Toggle HUD.
+
+### HUD binary audit
+
+The supplied target executable contains the game-specific console variable:
+
+```text
+ui.HideHud
+>0 Hides all HUD completely.
+Force HUD to be hidden.
+<=0: default HUD behavior
+1: HUD always hidden
+```
+
+Static audit of the validated executable:
+
+```text
+ui.HideHud UTF-16 string RVA : 0x26F3F78
+registration name xref RVA    : 0x000E779A
+CVar data-slot RVA            : 0x03803748
+native boolean getter RVA     : 0x0063AB50
+```
+
+Getter body:
+
+```asm
+mov rax, [rip + ui.HideHud_data_slot]
+cmp dword ptr [rax], 0
+setne al
+ret
+```
+
+### V0.3A implementation
+
+The ASI **does not overwrite the CVar value**.
+
+At runtime it:
+
+1. finds the UTF-16 `ui.HideHud` name inside `.rdata`;
+2. finds the unique RIP-relative registration reference in `.text`;
+3. follows the validated registration layout to the CVar data slot;
+4. locates the unique native boolean getter using that exact data slot;
+5. hooks only the getter with MinHook.
+
+Return policy:
+
+```text
+nativeHidden || modHidden
+```
+
+This means the mod can request HUD hiding without cancelling a native game
+request to hide the HUD.
+
+Runtime behavior:
+
+- F1 defaults to Toggle HUD;
+- first press: HUD hidden;
+- next press: HUD visible again;
+- overlay -> Features -> HUD Hidden can also change the runtime state;
+- runtime HUD state starts visible on every launch;
+- `[Features] ToggleHUD=1` enables the feature by default;
+- if resolution fails, Toggle HUD becomes unavailable while the rest of the
+  ASI stays fail-open.
+
+### V0.2A — Rebindable menu key / safe rollback
 
 **Status: TEST CANDIDATE**
 
@@ -231,7 +303,7 @@ Goal:
 - preserve menus/overlay;
 - no permanent asset edits.
 
-Status: **pending native UE4/HUD path audit**.
+Status: **implemented in V0.3A through native `ui.HideHud` getter hook; awaiting in-game validation**.
 
 ### 2. Movement Speed
 
@@ -416,3 +488,21 @@ Decision:
 
 This failed experiment is intentionally retained in the notebook only as a
 technical dead end, not as active code.
+
+
+### V0.3A
+
+- Cumulative from V0.2A.
+- Added binary audit for the game-specific `ui.HideHud` CVar.
+- Added semantic resolver anchored to the UTF-16 CVar name.
+- No raw fixed RVA is used as the runtime resolver.
+- Added native getter hook instead of writing the CVar.
+- F1 now toggles runtime HUD hidden/visible state.
+- Overlay Features tab exposes current HUD Hidden runtime state.
+- Native game HUD-hide state is preserved with `nativeHidden || modHidden`.
+- Reset Defaults restores the mod HUD runtime state to visible.
+- Menu-key rebinding from V0.2A is preserved.
+- Remaining Movement Speed / Action Recovery / Skip Intro / Third Person hooks
+  are still pending.
+
+**Validation:** awaiting first V0.3A in-game test.
