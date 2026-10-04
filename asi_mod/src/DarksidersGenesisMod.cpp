@@ -13,6 +13,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <array>
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cwchar>
 #include <string>
@@ -44,6 +45,9 @@ std::atomic_bool g_imguiReady{false};
 std::atomic_bool g_overlayVisible{false};
 std::atomic_bool g_captureMenuKey{false};
 std::atomic_int g_capturedMenuKey{0};
+std::atomic_bool g_introCVarResolved{false};
+std::atomic_bool g_introCVarApplied{false};
+int** g_introCVarDataSlot = nullptr;
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -443,6 +447,125 @@ struct Config {
 
 Config g_config;
 
+BYTE* FindPatternInMainModule(const int* pattern, size_t patternLength) {
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module || !pattern || patternLength == 0) {
+        return nullptr;
+    }
+
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return nullptr;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return nullptr;
+    }
+
+    const size_t imageSize = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
+    if (imageSize < patternLength) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i <= imageSize - patternLength; ++i) {
+        bool match = true;
+        for (size_t j = 0; j < patternLength; ++j) {
+            if (pattern[j] >= 0 && base[i + j] != static_cast<BYTE>(pattern[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return base + i;
+        }
+    }
+
+    return nullptr;
+}
+
+bool ResolveIntroCVarDataSlot() {
+    if (g_introCVarResolved.load()) {
+        return g_introCVarDataSlot != nullptr;
+    }
+
+    // Unique x64 use-site for g.PlayIntroCinematicOnBoot in the audited EXE:
+    // mov rax,[rip+slot] ; cmp dword ptr [rax],0 ; je ... ;
+    // lea rcx,[rdi+0x688] ; xor edx,edx
+    static constexpr int kPattern[] = {
+        0x48, 0x8B, 0x05, -1, -1, -1, -1,
+        0x83, 0x38, 0x00,
+        0x74, -1,
+        0x48, 0x8D, 0x8F, 0x88, 0x06, 0x00, 0x00,
+        0x33, 0xD2
+    };
+
+    BYTE* hit = FindPatternInMainModule(kPattern, ARRAYSIZE(kPattern));
+    if (!hit) {
+        g_introCVarResolved.store(true);
+        Log("SkipIntro: signature NOT FOUND; feature stays fail-open");
+        return false;
+    }
+
+    const int32_t displacement = *reinterpret_cast<const int32_t*>(hit + 3);
+    BYTE* slotAddress = hit + 7 + displacement;
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const size_t imageSize = static_cast<size_t>(nt->OptionalHeader.SizeOfImage);
+
+    if (slotAddress < base || slotAddress + sizeof(void*) > base + imageSize) {
+        g_introCVarResolved.store(true);
+        Log("SkipIntro: decoded CVar slot is outside the main module; refusing write");
+        return false;
+    }
+
+    g_introCVarDataSlot = reinterpret_cast<int**>(slotAddress);
+    g_introCVarResolved.store(true);
+
+    const size_t hitRva = static_cast<size_t>(hit - base);
+    const size_t slotRva = static_cast<size_t>(slotAddress - base);
+    Log("SkipIntro: signature resolved hit RVA=0x%zX data-slot RVA=0x%zX", hitRva, slotRva);
+    return true;
+}
+
+bool ApplySkipIntroSetting() {
+    if (!ResolveIntroCVarDataSlot() || !g_introCVarDataSlot) {
+        g_introCVarApplied.store(false);
+        return false;
+    }
+
+    int* data = *g_introCVarDataSlot;
+    if (!data) {
+        g_introCVarApplied.store(false);
+        Log("SkipIntro: CVar data pointer not ready yet");
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(data, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & PAGE_GUARD) != 0 ||
+        (mbi.Protect & PAGE_NOACCESS) != 0) {
+        g_introCVarApplied.store(false);
+        Log("SkipIntro: CVar data pointer failed memory validation");
+        return false;
+    }
+
+    // Game semantics: >0 enables the intro cinematic video on boot.
+    // Mod semantics: SkipIntroVideos=1 therefore forces the CVar to zero.
+    const int desired = g_config.skipIntroEnabled ? 0 : 1;
+    *data = desired;
+    g_introCVarApplied.store(true);
+    Log("SkipIntro: g.PlayIntroCinematicOnBoot forced to %d (SkipIntroVideos=%d)",
+        desired,
+        g_config.skipIntroEnabled ? 1 : 0);
+    return true;
+}
+
 bool IsFeatureEnabled(Action action) {
     switch (action) {
     case Action::ToggleHUD:
@@ -473,6 +596,22 @@ bool KeyPressed(int vk) {
 
 void TriggerAction(Action action, int functionKey) {
     if (action == Action::None) {
+        return;
+    }
+
+    if (action == Action::SkipIntroVideos) {
+        g_config.skipIntroEnabled = !g_config.skipIntroEnabled;
+        const bool applied = ApplySkipIntroSetting();
+        g_config.Save();
+
+        g_lastAction = std::string("Skip Intro Videos ") +
+            (g_config.skipIntroEnabled ? "ON" : "OFF") +
+            (applied ? "" : " [CVar pending]");
+
+        Log("F%d -> Skip Intro Videos %s, runtime apply=%s",
+            functionKey,
+            g_config.skipIntroEnabled ? "ON" : "OFF",
+            applied ? "OK" : "PENDING");
         return;
     }
 
@@ -781,11 +920,23 @@ void DrawOverlay() {
                 ImGui::Unindent();
             }
 
-            DrawFeatureRow("Skip Intro Videos", &g_config.skipIntroEnabled, "UE4 MoviePlayer audit started");
+            if (ImGui::Checkbox("Skip Intro Videos", &g_config.skipIntroEnabled)) {
+                ApplySkipIntroSetting();
+                g_config.Save();
+            }
+            ImGui::SameLine(260.0f);
+            ImGui::TextDisabled(
+                "%s",
+                g_introCVarApplied.load()
+                    ? "Native g.PlayIntroCinematicOnBoot CVar active"
+                    : "Native CVar found; runtime apply pending"
+            );
             DrawFeatureRow("Third Person", &g_config.thirdPersonEnabled, "Camera hook pending");
 
             ImGui::Spacing();
-            ImGui::TextDisabled("Values above are stored now; gameplay application arrives feature-by-feature.");
+            ImGui::TextDisabled(
+                "Skip Intro is now native. Other gameplay features arrive feature-by-feature."
+            );
             ImGui::EndTabItem();
         }
 
@@ -852,9 +1003,9 @@ void DrawOverlay() {
             ImGui::TextWrapped("Size: 62,113,280 bytes");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "The executable imports DXGI and D3D11 directly. It also contains UE4 MoviePlayer "
-                "symbols including StartupMovies and WindowsMoviePlayer, which is the active lead "
-                "for the intro-video feature."
+                "Skip Intro now uses the game's own g.PlayIntroCinematicOnBoot console-variable data. "
+                "The ASI resolves its runtime storage by a unique code signature and forces it to 0 "
+                "when SkipIntroVideos is enabled. No movie or PAK file is modified."
             );
             ImGui::EndTabItem();
         }
@@ -1105,12 +1256,23 @@ DWORD WINAPI MainThread(LPVOID) {
 
     g_config.Load();
 
+    // Apply before renderer hook setup so the boot-cinematic gate sees the requested
+    // value as early as possible. Static UE4 console-variable registration should
+    // already be complete when our DXGI loader is called.
+    const bool introAppliedEarly = ApplySkipIntroSetting();
+    Log("SkipIntro early apply: %s", introAppliedEarly ? "OK" : "PENDING");
+
     if (!DiscoverAndHookD3D11()) {
         Log("Overlay hook setup FAILED. Mod stays fail-open; game should continue normally.");
         return 0;
     }
 
-    Log("Core initialization complete. Press Insert after the first game frame.");
+    if (!introAppliedEarly) {
+        ApplySkipIntroSetting();
+    }
+
+    Log("Core initialization complete. Press %s after the first game frame.",
+        KeyDisplayName(g_config.menuKey).c_str());
     return 0;
 }
 
