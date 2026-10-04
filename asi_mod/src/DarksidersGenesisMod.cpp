@@ -558,6 +558,15 @@ bool ApplySkipIntroSetting() {
     }
 
     MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(data, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & PAGE_GUARD) != 0 ||
+        (mbi.Protect & PAGE_NOACCESS) != 0) {
+        g_introCVarApplied.store(false);
+        Log("SkipIntro: CVar data pointer failed memory validation");
+        return false;
+    }
+
     const DWORD protection = mbi.Protect & 0xFF;
     const bool writable =
         protection == PAGE_READWRITE ||
@@ -565,13 +574,9 @@ bool ApplySkipIntroSetting() {
         protection == PAGE_EXECUTE_READWRITE ||
         protection == PAGE_EXECUTE_WRITECOPY;
 
-    if (VirtualQuery(data, &mbi, sizeof(mbi)) != sizeof(mbi) ||
-        mbi.State != MEM_COMMIT ||
-        (mbi.Protect & PAGE_GUARD) != 0 ||
-        (mbi.Protect & PAGE_NOACCESS) != 0 ||
-        !writable) {
+    if (!writable) {
         g_introCVarApplied.store(false);
-        Log("SkipIntro: CVar data pointer failed writable-memory validation");
+        Log("SkipIntro: CVar data page is not writable (protect=0x%lX)", mbi.Protect);
         return false;
     }
 
