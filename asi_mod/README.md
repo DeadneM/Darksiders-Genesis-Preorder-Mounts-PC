@@ -311,13 +311,23 @@ Goal:
 
 - adjustable movement speed;
 - user-facing multiplier in overlay/INI;
-- avoid globally changing game time.
+- avoid globally changing game time;
+- do not affect enemies/NPCs;
+- do not consume the separate horse-speed roadmap item.
 
 Default option state: **Enabled**.
 
 Initial stored test value: **1.15x**.
 
-Status: **pending player movement component audit**.
+Status: **implemented in V0.4A; awaiting in-game validation**.
+
+Implementation notes:
+
+- resolves the Mayhem reflection registration for `GetMaxSpeed`;
+- identifies the `AMayhemCharacter::GetMaxSpeed` native helper through its exec wrapper;
+- applies the multiplier only when `APawn::IsLocallyControlled` is true;
+- explicitly excludes `AMayhemPlayerCharacter::IsHorseActive`;
+- horse movement remains untouched for the dedicated Horse Speed / Sprint feature.
 
 ### 3. Action Recovery Speed
 
@@ -566,3 +576,73 @@ technical dead end, not as active code.
   are still pending.
 
 **Validation:** awaiting first V0.3A in-game test.
+
+
+## V0.4A — On-foot Movement Speed
+
+**Status: TEST CANDIDATE**
+
+Cumulative from V0.3A.
+
+### Binary audit
+
+The game exposes the relevant Mayhem functions through UE4 reflection:
+
+```text
+GetMaxSpeed
+GetDefaultMaxSpeed
+GetMayhemMovementComponent
+AddSpeedLimitOverride
+StopOverridingMaxSpeed
+ESpeedModType::ADD_VALUE
+ESpeedModType::ADD_MOD
+ESpeedModType::MULTIPLY_MOD
+```
+
+For the audited executable, the `GetMaxSpeed` Blueprint exec wrapper calls the
+native helper at RVA `0x56FBC0`. That helper retrieves the Mayhem movement
+component from character offset `+0xA20` and dispatches its virtual max-speed
+query.
+
+Direct gameplay callers of this helper were also found outside the reflection
+wrapper, confirming that it participates in real movement calculations.
+
+### Player-only filtering
+
+The feature must not speed enemies or NPCs.
+
+The hook therefore applies the multiplier only when the character's inherited
+`APawn::IsLocallyControlled` virtual returns true.
+
+The audited UE4 wrapper dispatches this virtual through vtable offset:
+
+```text
+0x680
+```
+
+### Horse exclusion
+
+Horse speed is a separate TODO and must remain independently tunable.
+
+`AMayhemPlayerCharacter::IsHorseActive` was audited and checks:
+
+```asm
+cmp qword ptr [rcx + 0xE70], 0
+setne al
+```
+
+V0.4A therefore leaves `GetMaxSpeed` unchanged while a horse mount is active.
+
+### Runtime behavior
+
+- Movement Speed is enabled by default.
+- Default multiplier: **1.15x**.
+- F2 toggles Movement Speed ON/OFF.
+- Overlay slider range: **1.00x to 2.50x**.
+- Slider changes save immediately to the INI.
+- No global TimeScale modification.
+- No enemy/NPC speed modification.
+- No horse-speed modification.
+- Resolver failure is fail-open and leaves vanilla movement untouched.
+
+**Validation:** awaiting first V0.4A in-game test.
