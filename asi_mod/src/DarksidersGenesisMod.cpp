@@ -8,6 +8,8 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -133,10 +135,9 @@ void Log(const char* format, ...) {
     GetLocalTime(&st);
 
     char line[2300]{};
-    snprintf_s(
+    sprintf_s(
         line,
         sizeof(line),
-        _TRUNCATE,
         "[%04u-%02u-%02u %02u:%02u:%02u.%03u] %s\r\n",
         st.wYear,
         st.wMonth,
@@ -629,7 +630,7 @@ void DrawOverlay() {
 
                     ImGui::TableSetColumnIndex(1);
                     char comboId[32]{};
-                    snprintf_s(comboId, sizeof(comboId), _TRUNCATE, "##HotkeyF%d", i + 1);
+                    sprintf_s(comboId, sizeof(comboId), "##HotkeyF%d", i + 1);
 
                     int current = static_cast<int>(g_config.hotkeys[static_cast<size_t>(i)]);
                     if (current < 0 || current >= static_cast<int>(Action::Count)) {
