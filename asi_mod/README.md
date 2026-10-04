@@ -84,7 +84,7 @@ This gives the Skip Intro feature a real engine-native investigation path.
 
 ---
 
-## V0.2 — Rebindable menu key
+## V0.2A — Rebindable menu key / safe rollback
 
 **Status: TEST CANDIDATE**
 
@@ -391,3 +391,28 @@ DarksidersGenesisMod.asi  ec9b951727edecbeef73c984068107c06d183d078370b412889bad
 - Gameplay features remain enabled by default and continue to be developed independently.
 
 **Validation:** awaiting V0.2 in-game test.
+
+
+## Rejected experiment — direct Skip Intro CVar write
+
+A post-V0.2 experimental branch attempted to control the native
+`g.PlayIntroCinematicOnBoot` variable directly from the ASI.
+
+**Result: REJECTED.**
+
+User test:
+
+- normal game: did not work as intended;
+- DLC: crash.
+
+Decision:
+
+- direct runtime pointer/write approach is removed from the active base;
+- do not reuse this implementation;
+- V0.2A returns to the validated V0.1 renderer/input foundation plus only the
+  menu-key rebinding feature;
+- future Skip Intro work must use a safer, more specific startup-movie path and
+  must be tested against both normal game and DLC before promotion.
+
+This failed experiment is intentionally retained in the notebook only as a
+technical dead end, not as active code.
