@@ -1,5 +1,5 @@
 #include <windows.h>
-#include <dxgi.h>
+#include <cwchar>
 
 static HMODULE g_self = nullptr;
 static HMODULE g_realDxgi = nullptr;
