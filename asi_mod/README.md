@@ -86,7 +86,44 @@ This gives the Skip Intro feature a real engine-native investigation path.
 
 ## V0.1 — Overlay foundation
 
-**Status: TEST CANDIDATE / NOT VALIDATED YET**
+**Status: TEST CANDIDATE / COMPILES SUCCESSFULLY / NOT VALIDATED IN GAME YET**
+
+### First successful Windows build
+
+GitHub Actions run:
+
+```text
+37231616133
+```
+
+Build result: **PASS**
+
+Artifacts:
+
+```text
+dxgi.dll
+  SHA-256 513262d7212e4c4fe907ab83e8794704b8970dc2b1e97137b152fafd3abb16f6
+
+DarksidersGenesisMod.asi
+  SHA-256 ec9b951727edecbeef73c984068107c06d183d078370b412889bad402f73e1e5
+
+DarksidersGenesis_ASI_V0.1_TEST.zip
+  SHA-256 7cf4fb36e1e72a1ad759a97a9ffd418757bd9dd0d5795b09a6c4627e6d7ced1d
+```
+
+Both compiled binaries were independently checked as **PE32+ x86-64 DLLs**.
+
+### Build-system notes
+
+The first CI pass exposed two build-environment details which are now documented:
+
+- GitHub `windows-latest` moved to the Windows 2025 / Visual Studio 2026 image,
+  so the workflow now uses the `Visual Studio 18 2026` CMake generator.
+- MinHook's Windows x64 output uses its configuration postfix
+  (`minhook.x64.lib`); CMake target resolution was hardened so the ASI links
+  the actual MinHook target instead of guessing a library filename.
+
+The source itself then compiled and linked successfully.
 
 ### Purpose
 
@@ -307,4 +344,15 @@ Then verify:
 - Gameplay hooks deliberately left pending for the first foundation test.
 - Startup movie strings audited and recorded.
 
-**Validation:** awaiting first in-game test.
+**Compilation:** PASS.
+
+**In-game validation:** awaiting first test.
+
+**First successful build run:** `37231616133`.
+
+**Canonical V0.1-test binary hashes before README-only rebuild:**
+
+```text
+dxgi.dll                  513262d7212e4c4fe907ab83e8794704b8970dc2b1e97137b152fafd3abb16f6
+DarksidersGenesisMod.asi  ec9b951727edecbeef73c984068107c06d183d078370b412889bad402f73e1e5
+```
