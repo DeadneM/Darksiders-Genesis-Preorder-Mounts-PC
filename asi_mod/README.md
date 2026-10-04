@@ -84,6 +84,41 @@ This gives the Skip Intro feature a real engine-native investigation path.
 
 ---
 
+## V0.3A — Experimental Skip Intro branch bypass
+
+**Status: TEST CANDIDATE / SEPARATE FROM SAFE V0.2A**
+
+V0.3A starts strictly from the safe V0.2A rebind-only rollback.
+
+The rejected direct CVar-storage write is **not present**.
+
+New method:
+
+- verify the audited PE identity first:
+  - TimeDateStamp = `0x5E665B81`;
+  - SizeOfImage = `0x03DDF000`;
+- scan only the executable `.text` section;
+- require exactly one complete signature for the native
+  `g.PlayIntroCinematicOnBoot` decision block;
+- patch only the conditional opcode:
+  - original: `74 2B` = JE +0x2B;
+  - experimental bypass: `EB 2B` = JMP +0x2B;
+- the patch is reversible in memory;
+- no CVar pointer is dereferenced;
+- no game file is edited;
+- any identity/signature mismatch fails closed and leaves the game code untouched.
+
+The branch corresponds to audited VA `0x14063C46F` in the supplied EXE.
+Its purpose is to emulate the native CVar-zero path by skipping only the
+intro-creation block.
+
+V0.3A must be tested independently in:
+
+- normal game;
+- DLC.
+
+It is not promoted until both paths are stable.
+
 ## V0.2A — Rebindable menu key / safe rollback
 
 **Status: TEST CANDIDATE**
@@ -416,3 +451,18 @@ Decision:
 
 This failed experiment is intentionally retained in the notebook only as a
 technical dead end, not as active code.
+
+
+### V0.3A
+
+- Base: safe V0.2A rebind-only rollback.
+- Adds experimental Skip Intro code-branch bypass.
+- Does **not** reuse the rejected direct CVar data write.
+- Exact branch signature audited around VA `0x14063C465`.
+- Only opcode `74` -> `EB` is changed when enabled.
+- PE identity guard + unique .text signature required.
+- Patch is reversible.
+- Fail-closed on every mismatch.
+- SkipIntroVideos remains enabled by default.
+
+**Validation:** pending normal-game + DLC test.
