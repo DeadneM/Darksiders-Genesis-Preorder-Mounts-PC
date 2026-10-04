@@ -21,7 +21,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace {
 
-constexpr const char* kBuild = "0.4A-movement-speed-test";
+constexpr const char* kBuild = "0.5A-action-recovery-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -33,11 +33,13 @@ using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 using HudHiddenGetterFn = bool(*)();
 using CharacterGetMaxSpeedFn = float(*)(void*);
+using ActionGateFn = bool(*)(void*, unsigned char);
 
 PresentFn g_originalPresent = nullptr;
 ResizeBuffersFn g_originalResizeBuffers = nullptr;
 HudHiddenGetterFn g_originalHudHiddenGetter = nullptr;
 CharacterGetMaxSpeedFn g_originalCharacterGetMaxSpeed = nullptr;
+ActionGateFn g_originalActionGate = nullptr;
 
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
@@ -53,6 +55,7 @@ std::atomic_int g_capturedMenuKey{0};
 std::atomic_bool g_hudHidden{false};
 std::atomic_bool g_hudHookReady{false};
 std::atomic_bool g_movementHookReady{false};
+std::atomic_bool g_recoveryHookReady{false};
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -505,6 +508,46 @@ BYTE* FindBytes(const PeSectionView& section, const BYTE* bytes, size_t length) 
     return nullptr;
 }
 
+BYTE* FindUniquePattern(
+    const PeSectionView& section,
+    const int* pattern,
+    size_t patternLength,
+    size_t* outCount = nullptr
+) {
+    if (outCount) {
+        *outCount = 0;
+    }
+
+    if (!section.begin || !pattern || patternLength == 0 || section.size < patternLength) {
+        return nullptr;
+    }
+
+    BYTE* match = nullptr;
+    size_t count = 0;
+
+    for (size_t i = 0; i <= section.size - patternLength; ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < patternLength; ++j) {
+            if (pattern[j] >= 0 &&
+                section.begin[i + j] != static_cast<BYTE>(pattern[j])) {
+                ok = false;
+                break;
+            }
+        }
+
+        if (ok) {
+            match = section.begin + i;
+            ++count;
+        }
+    }
+
+    if (outCount) {
+        *outCount = count;
+    }
+
+    return count == 1 ? match : nullptr;
+}
+
 BYTE* FindWideString(const PeSectionView& section, const wchar_t* text) {
     if (!text) {
         return nullptr;
@@ -837,6 +880,138 @@ bool InstallMovementSpeedHook() {
     return true;
 }
 
+BYTE* ResolveActionRecoveryGate() {
+    PeSectionView text{};
+    if (!GetMainModuleSection(".text", text)) {
+        Log("Recovery hook: failed to enumerate .text");
+        return nullptr;
+    }
+
+    // UMayhemPlayerAbilityComponent movement gate, audited against the supplied EXE.
+    // ECharacterActions::MOVE == 0x1D.
+    // The native function compares:
+    //   MoveInterruptDelaySec [this+0x110]
+    //   elapsed runtime timer [this+0x114]
+    // and rejects MOVE while delay > elapsed.
+    static constexpr int kPattern[] = {
+        0x40, 0x57,
+        0x48, 0x83, 0xEC, 0x20,
+        0x0F, 0xB6, 0xFA,
+        0x80, 0xFA, 0x1D,
+        0x75, -1,
+        0xF3, 0x0F, 0x10, 0x81, 0x10, 0x01, 0x00, 0x00,
+        0x0F, 0x2F, 0x81, 0x14, 0x01, 0x00, 0x00,
+        0x76, -1,
+        0x32, 0xC0
+    };
+
+    size_t matchCount = 0;
+    BYTE* target = FindUniquePattern(
+        text,
+        kPattern,
+        ARRAYSIZE(kPattern),
+        &matchCount
+    );
+
+    if (!target) {
+        Log("Recovery hook: movement-gate signature match count=%zu", matchCount);
+        return nullptr;
+    }
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    Log(
+        "Recovery hook: movement gate resolved RVA=0x%zX",
+        static_cast<size_t>(target - base)
+    );
+
+    return target;
+}
+
+bool HookActionGate(void* abilityComponent, unsigned char action) {
+    if (!g_originalActionGate) {
+        return false;
+    }
+
+    constexpr unsigned char kMoveAction = 0x1D;
+
+    if (action != kMoveAction ||
+        !g_config.actionRecoveryEnabled ||
+        !abilityComponent) {
+        return g_originalActionGate(abilityComponent, action);
+    }
+
+    float multiplier = g_config.actionRecoveryMultiplier;
+    if (multiplier < 1.0f) multiplier = 1.0f;
+    if (multiplier > 10.0f) multiplier = 10.0f;
+
+    if (multiplier <= 1.0001f) {
+        return g_originalActionGate(abilityComponent, action);
+    }
+
+    BYTE* object = reinterpret_cast<BYTE*>(abilityComponent);
+    float* moveInterruptDelay = reinterpret_cast<float*>(object + 0x110);
+    float* elapsedTimer = reinterpret_cast<float*>(object + 0x114);
+
+    const float originalDelay = *moveInterruptDelay;
+    const float elapsed = *elapsedTimer;
+
+    // Reject obviously invalid/corrupt values and fall back to vanilla logic.
+    if (!(originalDelay >= 0.0f && originalDelay < 60.0f) ||
+        !(elapsed >= 0.0f && elapsed < 600.0f)) {
+        return g_originalActionGate(abilityComponent, action);
+    }
+
+    const float effectiveDelay = originalDelay / multiplier;
+
+    // Temporary, stack-scoped override only for this native gate evaluation.
+    // The original object value is restored immediately after the game finishes
+    // its full action checks.
+    *moveInterruptDelay = effectiveDelay;
+    const bool result = g_originalActionGate(abilityComponent, action);
+    *moveInterruptDelay = originalDelay;
+
+    return result;
+}
+
+bool InstallActionRecoveryHook() {
+    BYTE* target = ResolveActionRecoveryGate();
+    if (!target) {
+        Log("Recovery hook: resolver failed; feature remains fail-open");
+        return false;
+    }
+
+    const MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
+        Log("Recovery hook: MinHook initialize FAILED status=%d", static_cast<int>(initStatus));
+        return false;
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        target,
+        reinterpret_cast<LPVOID>(&HookActionGate),
+        reinterpret_cast<LPVOID*>(&g_originalActionGate)
+    );
+
+    if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+        Log("Recovery hook: create FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    status = MH_EnableHook(target);
+    if (status != MH_OK && status != MH_ERROR_ENABLED) {
+        Log("Recovery hook: enable FAILED status=%d", static_cast<int>(status));
+        return false;
+    }
+
+    g_recoveryHookReady.store(true);
+    Log(
+        "Recovery hook: READY multiplier=%.3fx move-action-only=1 field-write=purely-temporary",
+        g_config.actionRecoveryMultiplier
+    );
+    return true;
+}
+
 bool InstallHudHook() {
     BYTE* getter = ResolveHudHiddenGetter();
     if (!getter) {
@@ -906,11 +1081,6 @@ void TriggerAction(Action action, int functionKey) {
     }
 
     const char* label = ActionLabel(action);
-    if (!IsFeatureEnabled(action)) {
-        g_lastAction = std::string(label) + " disabled in config";
-        Log("F%d -> %s ignored (feature disabled)", functionKey, label);
-        return;
-    }
 
     if (action == Action::ToggleHUD) {
         if (!g_hudHookReady.load()) {
@@ -943,6 +1113,32 @@ void TriggerAction(Action action, int functionKey) {
             g_config.movementSpeedEnabled ? "ON" : "OFF",
             g_config.movementSpeedMultiplier
         );
+        return;
+    }
+
+    if (action == Action::ActionRecovery) {
+        if (!g_recoveryHookReady.load()) {
+            g_lastAction = "Action Recovery [hook unavailable]";
+            Log("F%d -> Action Recovery ignored (native hook unavailable)", functionKey);
+            return;
+        }
+
+        g_config.actionRecoveryEnabled = !g_config.actionRecoveryEnabled;
+        g_config.Save();
+        g_lastAction = std::string("Action Recovery ") +
+            (g_config.actionRecoveryEnabled ? "ON" : "OFF");
+        Log(
+            "F%d -> Action Recovery %s multiplier=%.3fx",
+            functionKey,
+            g_config.actionRecoveryEnabled ? "ON" : "OFF",
+            g_config.actionRecoveryMultiplier
+        );
+        return;
+    }
+
+    if (!IsFeatureEnabled(action)) {
+        g_lastAction = std::string(label) + " disabled in config";
+        Log("F%d -> %s ignored (feature disabled)", functionKey, label);
         return;
     }
 
@@ -1215,9 +1411,9 @@ void DrawOverlay() {
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextWrapped(
-                "V0.4 is cumulative: validated overlay foundation, rebindable menu key, native "
-                "Toggle HUD, plus player-only Movement Speed. The movement multiplier hooks the "
-                "game's AMayhemCharacter::GetMaxSpeed helper and explicitly excludes horseback."
+                "V0.5 is cumulative: overlay foundation, rebindable menu key, native Toggle HUD, "
+                "player-only Movement Speed, plus Action Recovery. Recovery scales only the native "
+                "MOVE interrupt delay and leaves animations and all other action checks untouched."
             );
             ImGui::EndTabItem();
         }
@@ -1279,11 +1475,36 @@ void DrawOverlay() {
                 ImGui::Unindent();
             }
 
-            DrawFeatureRow("Action Recovery", &g_config.actionRecoveryEnabled, "Hook pending");
+            if (ImGui::Checkbox("Action Recovery", &g_config.actionRecoveryEnabled)) {
+                g_config.Save();
+                g_lastAction = std::string("Action Recovery ") +
+                    (g_config.actionRecoveryEnabled ? "ON" : "OFF");
+            }
+            ImGui::SameLine(260.0f);
+            ImGui::TextDisabled(
+                "%s",
+                g_recoveryHookReady.load()
+                    ? "Native MOVE interrupt-delay gate"
+                    : "Native hook unavailable"
+            );
+
             if (g_config.actionRecoveryEnabled) {
                 ImGui::Indent();
                 ImGui::SetNextItemWidth(260.0f);
-                ImGui::SliderFloat("Recovery Multiplier", &g_config.actionRecoveryMultiplier, 1.00f, 5.00f, "%.2fx");
+                if (ImGui::SliderFloat(
+                    "Recovery Multiplier",
+                    &g_config.actionRecoveryMultiplier,
+                    1.00f,
+                    5.00f,
+                    "%.2fx"
+                )) {
+                    g_config.Save();
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("F3 toggles");
+                ImGui::TextDisabled(
+                    "Effective MOVE lock = native MoveInterruptDelaySec / multiplier."
+                );
                 ImGui::Unindent();
             }
 
@@ -1292,7 +1513,7 @@ void DrawOverlay() {
 
             ImGui::Spacing();
             ImGui::TextDisabled(
-                "Toggle HUD and on-foot Movement Speed are native; remaining gameplay features are pending."
+                "Toggle HUD, on-foot Movement Speed and Action Recovery are native; remaining features are pending."
             );
             ImGui::EndTabItem();
         }
@@ -1360,9 +1581,9 @@ void DrawOverlay() {
             ImGui::TextWrapped("Size: 62,113,280 bytes");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "Toggle HUD uses the game's native ui.HideHud path. Movement Speed resolves the "
-                "Mayhem GetMaxSpeed reflection registration, follows its native exec wrapper to "
-                "AMayhemCharacter::GetMaxSpeed, and multiplies only locally controlled on-foot players."
+                "Toggle HUD uses ui.HideHud. Movement Speed hooks AMayhemCharacter::GetMaxSpeed. "
+                "Action Recovery hooks the UMayhemPlayerAbilityComponent MOVE gate and temporarily "
+                "scales MoveInterruptDelaySec only while the native action check is running."
             );
             ImGui::EndTabItem();
         }
@@ -1624,6 +1845,10 @@ DWORD WINAPI MainThread(LPVOID) {
 
     if (!InstallMovementSpeedHook()) {
         Log("Movement Speed unavailable; other ASI features remain active.");
+    }
+
+    if (!InstallActionRecoveryHook()) {
+        Log("Action Recovery unavailable; other ASI features remain active.");
     }
 
     Log("Core initialization complete. Press %s after the first game frame.",
