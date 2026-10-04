@@ -13,13 +13,15 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 #include <array>
 #include <atomic>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <string>
 
 namespace {
 
-constexpr const char* kBuild = "0.2A-rebind-only-test";
+constexpr const char* kBuild = "0.3A-skipintro-branch-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -44,6 +46,9 @@ std::atomic_bool g_imguiReady{false};
 std::atomic_bool g_overlayVisible{false};
 std::atomic_bool g_captureMenuKey{false};
 std::atomic_int g_capturedMenuKey{0};
+std::atomic_bool g_skipIntroPatchResolved{false};
+std::atomic_bool g_skipIntroPatchActive{false};
+BYTE* g_skipIntroBranch = nullptr;
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -443,6 +448,178 @@ struct Config {
 
 Config g_config;
 
+bool IsAuditedExecutable() {
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module) {
+        return false;
+    }
+
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+
+    // Audited user EXE:
+    // SHA-256 9f4702024df5eea1d51df7745b0ad1ea95b97009982f73ddc1218c53dff33d54
+    // These PE invariants provide an additional fail-closed guard before the
+    // exact .text signature is accepted.
+    return nt->FileHeader.TimeDateStamp == 0x5E665B81u &&
+           nt->OptionalHeader.SizeOfImage == 0x03DDF000u;
+}
+
+BYTE* FindUniqueTextPattern(const int* pattern, size_t patternLength) {
+    HMODULE module = GetModuleHandleW(nullptr);
+    if (!module || !pattern || patternLength == 0) {
+        return nullptr;
+    }
+
+    BYTE* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return nullptr;
+    }
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return nullptr;
+    }
+
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    BYTE* unique = nullptr;
+    size_t matches = 0;
+
+    for (WORD sectionIndex = 0; sectionIndex < nt->FileHeader.NumberOfSections; ++sectionIndex) {
+        const IMAGE_SECTION_HEADER& section = sections[sectionIndex];
+        if (memcmp(section.Name, ".text", 5) != 0) {
+            continue;
+        }
+
+        BYTE* start = base + section.VirtualAddress;
+        const size_t size = static_cast<size_t>(section.Misc.VirtualSize);
+        if (size < patternLength) {
+            break;
+        }
+
+        for (size_t i = 0; i <= size - patternLength; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < patternLength; ++j) {
+                if (pattern[j] >= 0 && start[i + j] != static_cast<BYTE>(pattern[j])) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                unique = start + i;
+                ++matches;
+                if (matches > 1) {
+                    return nullptr;
+                }
+            }
+        }
+        break;
+    }
+
+    return matches == 1 ? unique : nullptr;
+}
+
+bool ResolveSkipIntroBranch() {
+    if (g_skipIntroPatchResolved.load()) {
+        return g_skipIntroBranch != nullptr;
+    }
+
+    g_skipIntroPatchResolved.store(true);
+
+    if (!IsAuditedExecutable()) {
+        Log("SkipIntro V0.3A: executable identity mismatch -> fail-closed");
+        return false;
+    }
+
+    // Audited at VA 0x14063C465:
+    // mov rax,[rip+g.PlayIntroCinematicOnBootData]
+    // cmp dword ptr [rax],0
+    // je  +0x2B
+    //
+    // We patch only the conditional opcode at +10:
+    // 74 2B (JE) -> EB 2B (JMP)
+    //
+    // This skips the game's intro-creation block exactly as the native
+    // CVar-zero path would, without dereferencing or writing the CVar storage.
+    static constexpr int kPattern[] = {
+        0x48, 0x8B, 0x05, -1, -1, -1, -1,
+        0x83, 0x38, 0x00,
+        0x74, 0x2B,
+        0x48, 0x8D, 0x8F, 0x88, 0x06, 0x00, 0x00,
+        0x33, 0xD2,
+        0xE8, -1, -1, -1, -1
+    };
+
+    BYTE* hit = FindUniqueTextPattern(kPattern, ARRAYSIZE(kPattern));
+    if (!hit || hit[10] != 0x74 || hit[11] != 0x2B) {
+        Log("SkipIntro V0.3A: unique branch signature not found -> fail-closed");
+        return false;
+    }
+
+    g_skipIntroBranch = hit + 10;
+
+    HMODULE module = GetModuleHandleW(nullptr);
+    const size_t rva = static_cast<size_t>(g_skipIntroBranch - reinterpret_cast<BYTE*>(module));
+    Log("SkipIntro V0.3A: branch resolved RVA=0x%zX opcode=%02X %02X",
+        rva,
+        g_skipIntroBranch[0],
+        g_skipIntroBranch[1]);
+    return true;
+}
+
+bool SetSkipIntroPatch(bool enabled) {
+    if (!ResolveSkipIntroBranch() || !g_skipIntroBranch) {
+        g_skipIntroPatchActive.store(false);
+        return false;
+    }
+
+    const BYTE desired = enabled ? 0xEB : 0x74;
+    if (g_skipIntroBranch[0] == desired && g_skipIntroBranch[1] == 0x2B) {
+        g_skipIntroPatchActive.store(enabled);
+        return true;
+    }
+
+    if (!((g_skipIntroBranch[0] == 0x74 || g_skipIntroBranch[0] == 0xEB) &&
+          g_skipIntroBranch[1] == 0x2B)) {
+        Log("SkipIntro V0.3A: branch bytes changed unexpectedly -> refusing patch");
+        g_skipIntroPatchActive.store(false);
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(g_skipIntroBranch, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        Log("SkipIntro V0.3A: VirtualProtect failed error=%lu", GetLastError());
+        g_skipIntroPatchActive.store(false);
+        return false;
+    }
+
+    *g_skipIntroBranch = desired;
+    FlushInstructionCache(GetCurrentProcess(), g_skipIntroBranch, 1);
+
+    DWORD ignored = 0;
+    VirtualProtect(g_skipIntroBranch, 1, oldProtect, &ignored);
+
+    const bool ok = g_skipIntroBranch[0] == desired && g_skipIntroBranch[1] == 0x2B;
+    g_skipIntroPatchActive.store(ok && enabled);
+
+    Log("SkipIntro V0.3A: %s -> opcode %02X 2B (%s)",
+        enabled ? "ENABLED" : "DISABLED",
+        desired,
+        ok ? "OK" : "VERIFY FAILED");
+    return ok;
+}
+
 bool IsFeatureEnabled(Action action) {
     switch (action) {
     case Action::ToggleHUD:
@@ -473,6 +650,22 @@ bool KeyPressed(int vk) {
 
 void TriggerAction(Action action, int functionKey) {
     if (action == Action::None) {
+        return;
+    }
+
+    if (action == Action::SkipIntroVideos) {
+        g_config.skipIntroEnabled = !g_config.skipIntroEnabled;
+        const bool applied = SetSkipIntroPatch(g_config.skipIntroEnabled);
+        g_config.Save();
+
+        g_lastAction = std::string("Skip Intro Videos ") +
+            (g_config.skipIntroEnabled ? "ON" : "OFF") +
+            (applied ? "" : " [patch refused]");
+
+        Log("F%d -> Skip Intro Videos %s, branch patch=%s",
+            functionKey,
+            g_config.skipIntroEnabled ? "ON" : "OFF",
+            applied ? "OK" : "FAILED");
         return;
     }
 
@@ -781,11 +974,23 @@ void DrawOverlay() {
                 ImGui::Unindent();
             }
 
-            DrawFeatureRow("Skip Intro Videos", &g_config.skipIntroEnabled, "UE4 MoviePlayer audit started");
+            if (ImGui::Checkbox("Skip Intro Videos", &g_config.skipIntroEnabled)) {
+                SetSkipIntroPatch(g_config.skipIntroEnabled);
+                g_config.Save();
+            }
+            ImGui::SameLine(260.0f);
+            ImGui::TextDisabled(
+                "%s",
+                g_skipIntroPatchActive.load()
+                    ? "Experimental branch bypass ACTIVE"
+                    : "Experimental branch bypass inactive"
+            );
             DrawFeatureRow("Third Person", &g_config.thirdPersonEnabled, "Camera hook pending");
 
             ImGui::Spacing();
-            ImGui::TextDisabled("Values above are stored now; gameplay application arrives feature-by-feature.");
+            ImGui::TextDisabled(
+                "V0.3A Skip Intro uses a reversible code-branch bypass; other gameplay hooks remain pending."
+            );
             ImGui::EndTabItem();
         }
 
@@ -852,9 +1057,9 @@ void DrawOverlay() {
             ImGui::TextWrapped("Size: 62,113,280 bytes");
             ImGui::Spacing();
             ImGui::TextWrapped(
-                "The executable imports DXGI and D3D11 directly. It also contains UE4 MoviePlayer "
-                "symbols including StartupMovies and WindowsMoviePlayer, which is the active lead "
-                "for the intro-video feature."
+                "Skip Intro V0.3A no longer writes the native CVar data pointer. It validates the "
+                "audited executable and changes only one boot-intro branch from JE to JMP. "
+                "The previous direct-CVar-write experiment is rejected."
             );
             ImGui::EndTabItem();
         }
@@ -1105,12 +1310,18 @@ DWORD WINAPI MainThread(LPVOID) {
 
     g_config.Load();
 
+    const bool skipIntroReady = SetSkipIntroPatch(g_config.skipIntroEnabled);
+    Log("SkipIntro V0.3A startup state: requested=%d applied=%s",
+        g_config.skipIntroEnabled ? 1 : 0,
+        skipIntroReady ? "YES" : "NO");
+
     if (!DiscoverAndHookD3D11()) {
         Log("Overlay hook setup FAILED. Mod stays fail-open; game should continue normally.");
         return 0;
     }
 
-    Log("Core initialization complete. Press Insert after the first game frame.");
+    Log("Core initialization complete. Press %s after the first game frame.",
+        KeyDisplayName(g_config.menuKey).c_str());
     return 0;
 }
 
