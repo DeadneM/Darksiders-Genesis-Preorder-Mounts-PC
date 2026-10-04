@@ -3,7 +3,7 @@ name: Build ASI Overlay
 on:
   push:
     branches:
-      - dev/asi-v0.3-toggle-hud
+      - dev/asi-v0.4-movement-speed
     paths:
       - "asi_mod/**"
       - ".github/workflows/build-asi-overlay.yml"
@@ -37,7 +37,7 @@ jobs:
           Copy-Item "asi_mod/config/DarksidersGenesisMod.ini" $dist
           Copy-Item "asi_mod/README.md" $dist
 
-          $zip = Join-Path $PWD "DarksidersGenesis_ASI_V0.3A_TOGGLE_HUD_TEST.zip"
+          $zip = Join-Path $PWD "DarksidersGenesis_ASI_V0.4A_MOVEMENT_SPEED_TEST.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
 
@@ -48,6 +48,6 @@ jobs:
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
-          name: DarksidersGenesis_ASI_V0.3A_TOGGLE_HUD_TEST
-          path: DarksidersGenesis_ASI_V0.3A_TOGGLE_HUD_TEST.zip
+          name: DarksidersGenesis_ASI_V0.4A_MOVEMENT_SPEED_TEST
+          path: DarksidersGenesis_ASI_V0.4A_MOVEMENT_SPEED_TEST.zip
           if-no-files-found: error
