@@ -720,4 +720,18 @@ V0.5A also fixes a hotkey-state issue inherited by Movement Speed:
 - F3 can likewise toggle Action Recovery both OFF and back ON.
 - Toggle HUD still respects its separate feature-enable checkbox.
 
+**Compilation:** PASS.
+
+**GitHub Actions run:** `37235986567`.
+
+Compiled binary hashes:
+
+```text
+dxgi.dll
+be75f8f2a12b1e44482ae5ffa76708e788eaddd64fdd591fff621b89a1e7277b
+
+DarksidersGenesisMod.asi
+10ee522195dd391da435249cdc9d4c1388de41c685db845a5bee7f1d8b7a6002
+```
+
 **Validation:** awaiting first V0.5A in-game test.
