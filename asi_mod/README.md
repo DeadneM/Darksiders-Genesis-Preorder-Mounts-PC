@@ -370,6 +370,66 @@ Default option state: **Enabled**.
 
 Status: **pending camera/player-controller audit**.
 
+### 6. Pistol Damage
+
+Goal:
+
+- increase pistol damage;
+- ideally expose a multiplier in the overlay/INI;
+- avoid affecting unrelated weapon classes.
+
+Status: **pending weapon-damage audit**.
+
+### 7. Melee Damage
+
+Goal:
+
+- increase melee damage;
+- keep the modifier separate from firearm damage;
+- ideally expose a multiplier in the overlay/INI.
+
+Status: **pending melee-damage audit**.
+
+### 8. Jump Height
+
+Goal:
+
+- increase jump height;
+- expose an adjustable multiplier if the native movement path allows it;
+- preserve reliable landing and collision behavior.
+
+Status: **pending character-movement audit**.
+
+### 9. Horse Speed / Sprint
+
+Goal:
+
+- increase normal horse movement speed;
+- increase horse sprint speed;
+- keep normal speed and sprint tunable independently if possible.
+
+Status: **pending mount movement/sprint audit**.
+
+### 10. FOV
+
+Goal:
+
+- expose an adjustable gameplay FOV;
+- keep it runtime-configurable from the overlay/INI;
+- preserve camera transitions and special camera states.
+
+Status: **pending camera/FOV audit**.
+
+### 11. Hotstreak Charge
+
+Goal:
+
+- increase Hotstreak charge/gain rate;
+- expose a configurable multiplier if the underlying system supports it;
+- avoid changing unrelated resource/ability charge systems.
+
+Status: **pending Hotstreak system audit**.
+
 ---
 
 ## Design rules
