@@ -14,9 +14,26 @@ include(FetchContent)
 FetchContent_Declare(
   minhook
   GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-  GIT_TAG v1.3.3
+  GIT_TAG v1.3.4
 )
 FetchContent_MakeAvailable(minhook)
+
+if(TARGET minhook)
+  set(DG_MINHOOK_TARGET minhook)
+else()
+  message(STATUS "MinHook CMake target not exported; using local fallback target")
+  add_library(dg_minhook STATIC
+    ${minhook_SOURCE_DIR}/src/buffer.c
+    ${minhook_SOURCE_DIR}/src/hook.c
+    ${minhook_SOURCE_DIR}/src/trampoline.c
+    ${minhook_SOURCE_DIR}/src/hde/hde64.c
+  )
+  target_include_directories(dg_minhook
+    PUBLIC ${minhook_SOURCE_DIR}/include
+    PRIVATE ${minhook_SOURCE_DIR}/src ${minhook_SOURCE_DIR}/src/hde
+  )
+  set(DG_MINHOOK_TARGET dg_minhook)
+endif()
 
 FetchContent_Declare(
   imgui
@@ -47,7 +64,7 @@ target_compile_definitions(DarksidersGenesisMod PRIVATE WIN32_LEAN_AND_MEAN NOMI
 target_include_directories(DarksidersGenesisMod PRIVATE ${minhook_SOURCE_DIR}/include)
 target_link_libraries(DarksidersGenesisMod PRIVATE
   imgui_static
-  minhook
+  ${DG_MINHOOK_TARGET}
   d3d11
   dxgi
   user32
