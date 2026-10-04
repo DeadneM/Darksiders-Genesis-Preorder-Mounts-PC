@@ -346,7 +346,25 @@ Default option state: **Enabled**.
 
 Initial stored test value: **2.00x**.
 
-Status: **pending state/action-lock audit**.
+Status: **implemented in V0.5A; awaiting in-game validation**.
+
+Native audit result:
+
+- owner: `UMayhemPlayerAbilityComponent`;
+- reflected field: `MoveInterruptDelaySec`;
+- field offset: `+0x110`;
+- runtime elapsed timer used by the same gate: `+0x114`;
+- `ECharacterActions::MOVE = 0x1D`;
+- native gate RVA in the audited executable: `0x5B3150`;
+- signature match count: exactly **1**.
+
+The native logic explicitly rejects `MOVE` while:
+
+```text
+MoveInterruptDelaySec > elapsed timer
+```
+
+V0.5A therefore scales only this delay during the native check.
 
 ### 4. Skip Intro Videos
 
@@ -535,31 +553,6 @@ DarksidersGenesisMod.asi  ec9b951727edecbeef73c984068107c06d183d078370b412889bad
 **Validation:** awaiting V0.2 in-game test.
 
 
-## Rejected experiment — direct Skip Intro CVar write
-
-A post-V0.2 experimental branch attempted to control the native
-`g.PlayIntroCinematicOnBoot` variable directly from the ASI.
-
-**Result: REJECTED.**
-
-User test:
-
-- normal game: did not work as intended;
-- DLC: crash.
-
-Decision:
-
-- direct runtime pointer/write approach is removed from the active base;
-- do not reuse this implementation;
-- V0.2A returns to the validated V0.1 renderer/input foundation plus only the
-  menu-key rebinding feature;
-- future Skip Intro work must use a safer, more specific startup-movie path and
-  must be tested against both normal game and DLC before promotion.
-
-This failed experiment is intentionally retained in the notebook only as a
-technical dead end, not as active code.
-
-
 ### V0.3A
 
 - Cumulative from V0.2A.
@@ -646,3 +639,85 @@ V0.4A therefore leaves `GetMaxSpeed` unchanged while a horse mount is active.
 - Resolver failure is fail-open and leaves vanilla movement untouched.
 
 **Validation:** awaiting first V0.4A in-game test.
+
+
+## V0.5A — Action Recovery / MOVE interrupt delay
+
+**Status: TEST CANDIDATE**
+
+Cumulative from V0.4A.
+
+### What was found
+
+The delay reported by the user is represented directly in
+`UMayhemPlayerAbilityComponent` as:
+
+```text
+MoveInterruptDelaySec
+```
+
+The generated reflection data confirms:
+
+```text
+UMayhemPlayerAbilityComponent object size: 0x118
+MoveInterruptDelaySec offset:              0x110
+runtime elapsed timer offset:              0x114
+```
+
+A unique native action-gate function was then identified at audited RVA:
+
+```text
+0x5B3150
+```
+
+Its opening logic is equivalent to:
+
+```text
+if action == ECharacterActions::MOVE (0x1D):
+    if MoveInterruptDelaySec > elapsed:
+        reject movement
+```
+
+This is the exact post-action movement lock targeted by the feature.
+
+### V0.5A implementation
+
+The mod does **not** speed up animations and does **not** change global
+TimeScale.
+
+For a MOVE action only:
+
+```text
+effectiveDelay = native MoveInterruptDelaySec / ActionRecoveryMultiplier
+```
+
+The ASI temporarily substitutes that effective value only while the original
+native action-gate function executes, then immediately restores the object's
+original value.
+
+This preserves every other native condition checked by the game.
+
+### Runtime behavior
+
+- Action Recovery is enabled by default.
+- Default multiplier: **2.00x**.
+- F3 toggles Action Recovery ON/OFF.
+- Overlay slider range: **1.00x to 5.00x**.
+- Slider changes are saved immediately.
+- 2.00x means the MOVE lock lasts half as long.
+- 5.00x means the MOVE lock lasts one fifth as long.
+- No animation-speed change.
+- No attack-speed change.
+- No global TimeScale change.
+- No permanent write to `MoveInterruptDelaySec`.
+- Signature mismatch is fail-open and leaves vanilla behavior untouched.
+
+### Additional input fix
+
+V0.5A also fixes a hotkey-state issue inherited by Movement Speed:
+
+- F2 can now re-enable Movement Speed after it has been toggled OFF.
+- F3 can likewise toggle Action Recovery both OFF and back ON.
+- Toggle HUD still respects its separate feature-enable checkbox.
+
+**Validation:** awaiting first V0.5A in-game test.
