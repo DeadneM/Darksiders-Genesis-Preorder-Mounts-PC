@@ -21,7 +21,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace {
 
-constexpr const char* kBuild = "0.5A-action-recovery-test";
+constexpr const char* kBuild = "0.5B-movement-virtual-fix-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -697,99 +697,55 @@ bool AddressInSection(const PeSectionView& section, const void* address) {
     return section.begin && p >= section.begin && p < section.begin + section.size;
 }
 
-BYTE* ResolveCharacterGetMaxSpeedNative() {
+BYTE* ResolveMovementComponentGetMaxSpeedOverride() {
     PeSectionView text{};
-    PeSectionView rdata{};
-    if (!GetMainModuleSection(".text", text) ||
-        !GetMainModuleSection(".rdata", rdata)) {
-        Log("Movement hook: failed to enumerate PE sections");
+    if (!GetMainModuleSection(".text", text)) {
+        Log("Movement hook: failed to enumerate .text");
         return nullptr;
     }
 
-    BYTE* maxSpeedName = FindAsciiString(rdata, "GetMaxSpeed");
-    BYTE* movementGetterName = FindAsciiString(rdata, "GetMayhemMovementComponent");
-    if (!maxSpeedName || !movementGetterName) {
-        Log("Movement hook: required Mayhem function names not found");
+    // V0.4A mistake:
+    // the old resolver hooked AMayhemCharacter::GetMaxSpeed, which only queries
+    // the movement component and is not the virtual used by movement physics.
+    //
+    // V0.5B targets the real UMayhemCharacterMovementComponent::GetMaxSpeed
+    // override. The base UCharacterMovementComponent virtual sits at vtable
+    // +0x3D0; Mayhem replaces that slot with this unique implementation.
+    //
+    // Audited RVA: 0x56FBE0
+    // UMayhemCharacterMovementComponent reflected object size: 0x850.
+    static constexpr int kPattern[] = {
+        0x4C, 0x8B, 0xDC,
+        0x55,
+        0x57,
+        0x49, 0x8D, 0x6B, 0xA1,
+        0x48, 0x81, 0xEC, 0xB8, 0x00, 0x00, 0x00,
+        0x8B, 0x81, 0x80, 0x07, 0x00, 0x00,
+        0x48, 0x8B, 0xF9,
+        0x2B, 0x81, 0xAC, 0x07, 0x00, 0x00
+    };
+
+    size_t matchCount = 0;
+    BYTE* target = FindUniquePattern(
+        text,
+        kPattern,
+        ARRAYSIZE(kPattern),
+        &matchCount
+    );
+
+    if (!target) {
+        Log("Movement hook: virtual GetMaxSpeed signature match count=%zu", matchCount);
         return nullptr;
     }
 
     HMODULE module = GetModuleHandleW(nullptr);
     BYTE* base = reinterpret_cast<BYTE*>(module);
-    const uintptr_t maxSpeedVA = reinterpret_cast<uintptr_t>(maxSpeedName);
-    const uintptr_t movementGetterVA = reinterpret_cast<uintptr_t>(movementGetterName);
-
-    BYTE* execWrapper = nullptr;
-    size_t execCandidates = 0;
-
-    for (size_t i = 0; i + 32 <= rdata.size; i += sizeof(uintptr_t)) {
-        BYTE* p = rdata.begin + i;
-        const uintptr_t name0 = *reinterpret_cast<const uintptr_t*>(p);
-        const uintptr_t func0 = *reinterpret_cast<const uintptr_t*>(p + 8);
-        const uintptr_t name1 = *reinterpret_cast<const uintptr_t*>(p + 16);
-
-        if (name0 != maxSpeedVA || name1 != movementGetterVA) {
-            continue;
-        }
-
-        BYTE* candidate = reinterpret_cast<BYTE*>(func0);
-        if (!AddressInSection(text, candidate)) {
-            continue;
-        }
-
-        // The native exec wrapper for AMayhemCharacter::GetMaxSpeed starts with
-        // push rbx / sub rsp,20h and contains one rel32 call to the real helper.
-        if (candidate[0] == 0x40 &&
-            candidate[1] == 0x53 &&
-            candidate[2] == 0x48 &&
-            candidate[3] == 0x83 &&
-            candidate[4] == 0xEC &&
-            candidate[5] == 0x20) {
-            execWrapper = candidate;
-            ++execCandidates;
-        }
-    }
-
-    if (execCandidates != 1 || !execWrapper) {
-        Log("Movement hook: GetMaxSpeed exec-wrapper match count=%zu", execCandidates);
-        return nullptr;
-    }
-
-    BYTE* nativeTarget = nullptr;
-    size_t callCount = 0;
-    for (size_t i = 0; i < 48; ++i) {
-        if (execWrapper[i] != 0xE8) {
-            continue;
-        }
-
-        const int32_t rel = *reinterpret_cast<const int32_t*>(execWrapper + i + 1);
-        BYTE* target = execWrapper + i + 5 + rel;
-        if (!AddressInSection(text, target)) {
-            continue;
-        }
-
-        static constexpr BYTE kExpectedPrefix[] = {
-            0x48, 0x8B, 0x89, 0x20, 0x0A, 0x00, 0x00,
-            0x48, 0x85, 0xC9
-        };
-
-        if (memcmp(target, kExpectedPrefix, sizeof(kExpectedPrefix)) == 0) {
-            nativeTarget = target;
-            ++callCount;
-        }
-    }
-
-    if (callCount != 1 || !nativeTarget) {
-        Log("Movement hook: native GetMaxSpeed target match count=%zu", callCount);
-        return nullptr;
-    }
-
     Log(
-        "Movement hook: AMayhemCharacter::GetMaxSpeed resolved execRVA=0x%zX nativeRVA=0x%zX",
-        static_cast<size_t>(execWrapper - base),
-        static_cast<size_t>(nativeTarget - base)
+        "Movement hook: UMayhemCharacterMovementComponent::GetMaxSpeed resolved RVA=0x%zX vtableSlot=0x3D0",
+        static_cast<size_t>(target - base)
     );
 
-    return nativeTarget;
+    return target;
 }
 
 bool IsLocallyControlledMayhemCharacter(void* character) {
@@ -803,7 +759,6 @@ bool IsLocallyControlledMayhemCharacter(void* character) {
     }
 
     // APawn::IsLocallyControlled virtual slot in the audited UE4 build.
-    // Reflection wrapper audit resolves to call qword ptr [vtable + 0x680].
     using IsLocallyControlledFn = bool(*)(void*);
     auto fn = reinterpret_cast<IsLocallyControlledFn>(vtable[0x680 / sizeof(void*)]);
     if (!fn) {
@@ -813,25 +768,29 @@ bool IsLocallyControlledMayhemCharacter(void* character) {
     return fn(character);
 }
 
-bool IsHorseActiveForPlayer(void* character) {
-    if (!character) {
-        return false;
-    }
-
-    // AMayhemPlayerCharacter::IsHorseActive reflection wrapper:
-    // cmp qword ptr [rcx + 0xE70], 0
-    return *reinterpret_cast<void**>(reinterpret_cast<BYTE*>(character) + 0xE70) != nullptr;
-}
-
-float HookCharacterGetMaxSpeed(void* character) {
+float HookCharacterGetMaxSpeed(void* movementComponent) {
     const float nativeSpeed = g_originalCharacterGetMaxSpeed
-        ? g_originalCharacterGetMaxSpeed(character)
+        ? g_originalCharacterGetMaxSpeed(movementComponent)
         : 0.0f;
 
     if (!g_config.movementSpeedEnabled ||
         nativeSpeed <= 0.0f ||
-        !IsLocallyControlledMayhemCharacter(character) ||
-        IsHorseActiveForPlayer(character)) {
+        !movementComponent) {
+        return nativeSpeed;
+    }
+
+    BYTE* component = reinterpret_cast<BYTE*>(movementComponent);
+
+    // UCharacterMovementComponent::CharacterOwner reflection offset.
+    void* characterOwner = *reinterpret_cast<void**>(component + 0x190);
+    if (!characterOwner || !IsLocallyControlledMayhemCharacter(characterOwner)) {
+        return nativeSpeed;
+    }
+
+    // EMovementMode:
+    // 1 = Walking, 2 = NavWalking. Do not modify falling/swimming/flying/custom.
+    const unsigned char movementMode = *(component + 0x1B0);
+    if (movementMode != 1 && movementMode != 2) {
         return nativeSpeed;
     }
 
@@ -843,7 +802,7 @@ float HookCharacterGetMaxSpeed(void* character) {
 }
 
 bool InstallMovementSpeedHook() {
-    BYTE* target = ResolveCharacterGetMaxSpeedNative();
+    BYTE* target = ResolveMovementComponentGetMaxSpeedOverride();
     if (!target) {
         Log("Movement hook: resolver failed; feature remains fail-open");
         return false;
@@ -874,7 +833,7 @@ bool InstallMovementSpeedHook() {
 
     g_movementHookReady.store(true);
     Log(
-        "Movement hook: READY multiplier=%.3fx player-only=1 horse-excluded=1",
+        "Movement hook: READY multiplier=%.3fx player-only=1 walking-only=1 virtualSlot=0x3D0",
         g_config.movementSpeedMultiplier
     );
     return true;
@@ -1459,7 +1418,7 @@ void DrawOverlay() {
             ImGui::TextDisabled(
                 "%s",
                 g_movementHookReady.load()
-                    ? "Player-only native GetMaxSpeed hook"
+                    ? "MovementComponent virtual GetMaxSpeed hook"
                     : "Native hook unavailable"
             );
 
@@ -1477,7 +1436,7 @@ void DrawOverlay() {
                 }
                 ImGui::SameLine();
                 ImGui::TextDisabled("F2 toggles");
-                ImGui::TextDisabled("On-foot only; horse speed is intentionally excluded.");
+                ImGui::TextDisabled("Walking/NavWalking only; physics virtual slot 0x3D0.");
                 ImGui::Unindent();
             }
 
