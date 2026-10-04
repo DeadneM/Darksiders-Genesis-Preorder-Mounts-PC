@@ -1,0 +1,53 @@
+name: Build ASI Overlay
+
+on:
+  push:
+    branches:
+      - dev/asi-overlay-v0.1
+    paths:
+      - "asi_mod/**"
+      - ".github/workflows/build-asi-overlay.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S asi_mod -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          Copy-Item "build/out/dxgi.dll" $dist
+          Copy-Item "build/out/DarksidersGenesisMod.asi" $dist
+          Copy-Item "asi_mod/config/DarksidersGenesisMod.ini" $dist
+          Copy-Item "asi_mod/README.md" $dist
+
+          $zip = Join-Path $PWD "DarksidersGenesis_ASI_V0.1_TEST.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -CompressionLevel Optimal
+
+          Get-FileHash "build/out/dxgi.dll" -Algorithm SHA256
+          Get-FileHash "build/out/DarksidersGenesisMod.asi" -Algorithm SHA256
+          Get-FileHash $zip -Algorithm SHA256
+
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarksidersGenesis_ASI_V0.1_TEST
+          path: DarksidersGenesis_ASI_V0.1_TEST.zip
+          if-no-files-found: error
