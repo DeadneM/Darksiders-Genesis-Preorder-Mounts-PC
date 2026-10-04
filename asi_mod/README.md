@@ -319,15 +319,23 @@ Default option state: **Enabled**.
 
 Initial stored test value: **1.15x**.
 
-Status: **implemented in V0.4A; awaiting in-game validation**.
+Status: **V0.4A rejected; corrected implementation in V0.5B awaiting validation**.
 
 Implementation notes:
 
-- resolves the Mayhem reflection registration for `GetMaxSpeed`;
-- identifies the `AMayhemCharacter::GetMaxSpeed` native helper through its exec wrapper;
-- applies the multiplier only when `APawn::IsLocallyControlled` is true;
-- explicitly excludes `AMayhemPlayerCharacter::IsHorseActive`;
-- horse movement remains untouched for the dedicated Horse Speed / Sprint feature.
+V0.4A originally resolved `AMayhemCharacter::GetMaxSpeed`, but user testing
+showed no movement-speed effect. That helper only queries the movement component
+and is not the physics virtual consumed by CharacterMovement.
+
+V0.5B corrects the target:
+
+- `UMayhemCharacterMovementComponent` reflected object size: `0x850`;
+- base `UCharacterMovementComponent::GetMaxSpeed` virtual slot: `+0x3D0`;
+- Mayhem override RVA in the audited executable: `0x56FBE0`;
+- the signature is unique in `.text`;
+- the hook checks `CharacterOwner` at `+0x190`;
+- applies only when `APawn::IsLocallyControlled` is true;
+- applies only in `Walking` / `NavWalking` movement modes.
 
 ### 3. Action Recovery Speed
 
@@ -638,7 +646,10 @@ V0.4A therefore leaves `GetMaxSpeed` unchanged while a horse mount is active.
 - No horse-speed modification.
 - Resolver failure is fail-open and leaves vanilla movement untouched.
 
-**Validation:** awaiting first V0.4A in-game test.
+**Validation:** **REJECTED**. User confirmed Movement Speed produced no effect.
+
+Root cause found during V0.5B audit: V0.4A hooked the character-side query helper
+instead of the actual CharacterMovement physics virtual.
 
 
 ## V0.5A — Action Recovery / MOVE interrupt delay
@@ -735,3 +746,68 @@ DarksidersGenesisMod.asi
 ```
 
 **Validation:** awaiting first V0.5A in-game test.
+
+
+## V0.5B — Movement Speed physics-virtual fix
+
+**Status: TEST CANDIDATE**
+
+Cumulative from V0.5A.
+
+### Why V0.4A failed
+
+V0.4A hooked the character-side helper used to *query* movement speed. User
+testing confirmed that changing its return value did not alter actual movement.
+
+Binary re-audit of the movement-component vtable showed the real path:
+
+```text
+UCharacterMovementComponent::GetMaxSpeed
+vtable slot: +0x3D0
+```
+
+The Mayhem movement component overrides this slot with:
+
+```text
+UMayhemCharacterMovementComponent::GetMaxSpeed
+audited RVA: 0x56FBE0
+class size:  0x850
+```
+
+This function is the layer that combines:
+
+- native movement-mode speed;
+- Mayhem speed limits;
+- ADD_VALUE modifiers;
+- ADD_MOD modifiers;
+- MULTIPLY_MOD modifiers.
+
+That is the correct place to scale the value seen by movement physics.
+
+### V0.5B policy
+
+The hook multiplies the native return only when:
+
+```text
+CharacterOwner != null
+APawn::IsLocallyControlled == true
+MovementMode == Walking or NavWalking
+MovementSpeed feature == enabled
+```
+
+So it does not globally modify movement components, enemies, falling, swimming,
+flying or custom movement modes.
+
+Default remains:
+
+```ini
+MovementSpeedMultiplier=1.150
+```
+
+For validation, test **2.00x** first so the effect is unmistakable.
+
+### Regression note
+
+Action Recovery from V0.5A is preserved unchanged.
+
+**Validation:** awaiting V0.5B in-game test.
