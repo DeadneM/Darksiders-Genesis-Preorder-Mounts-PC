@@ -5,8 +5,8 @@ Darksiders Genesis ASI mod. It is intentionally cumulative so development can
 be resumed later without reconstructing decisions from chat history.
 
 > Public `main` currently remains the validated **Pre-Order Mounts PC Unlocker**.
-> The ASI work is isolated on `dev/asi-overlay-v0.1` until the foundation is
-> validated in game.
+> **V0.1 overlay foundation is validated in game.** Further ASI work is kept on
+> experimental development branches until each feature is validated.
 
 ---
 
@@ -16,7 +16,7 @@ Build a small, robust Win64 ASI mod for **Darksiders Genesis** with:
 
 - a local `dxgi.dll` ASI loader;
 - an in-game overlay inspired by the validated Q Protocol UI model;
-- **Insert** to open/close the overlay;
+- a **rebindable menu key** to open/close the overlay, default **Insert**;
 - full mouse interaction while the overlay is visible;
 - F1-F12 fixed hotkey slots whose actions are reconfigurable;
 - one INI as the only configuration source;
@@ -84,9 +84,28 @@ This gives the Skip Intro feature a real engine-native investigation path.
 
 ---
 
-## V0.1 — Overlay foundation
+## V0.2 — Rebindable menu key
 
-**Status: TEST CANDIDATE / COMPILES SUCCESSFULLY / NOT VALIDATED IN GAME YET**
+**Status: TEST CANDIDATE**
+
+V0.2 keeps the validated V0.1 renderer/input foundation and makes the overlay
+open/close key fully rebindable at runtime.
+
+Behavior:
+
+- default remains `Insert`;
+- `General -> Rebind Menu Key` waits for the next keyboard key;
+- `Esc` cancels capture;
+- the new key is saved immediately to `[Overlay] MenuKey`;
+- Save / Reload / Reset Defaults all understand the menu binding;
+- Reset Defaults restores `Insert`;
+- arbitrary keyboard keys are persisted as a readable token when known, or
+  `VK_XX` for less common virtual keys;
+- the captured key is debounced so the same press does not instantly close the menu.
+
+### V0.1 — Overlay foundation
+
+**Status: VALIDATED IN GAME**
 
 ### First successful Windows build
 
@@ -136,7 +155,7 @@ It validates:
 3. D3D11 swap-chain discovery;
 4. Present + ResizeBuffers hooks;
 5. Dear ImGui initialization on the real game swap chain;
-6. Insert menu toggle;
+6. validated menu toggle;
 7. mouse input/cursor access;
 8. suppression of gameplay F1-F12 input while the menu is open;
 9. F1-F12 action mapping;
@@ -308,15 +327,15 @@ README.md
 
 Then verify:
 
-- [ ] Game boots normally.
+- [x] Game boots normally.
 - [ ] `DarksidersGenesisMod.log` is created.
 - [ ] Log says D3D11 hooks were installed.
 - [ ] Log says ImGui overlay is READY.
-- [ ] Insert opens the overlay.
-- [ ] Insert closes the overlay.
-- [ ] Mouse moves and clicks correctly inside the overlay.
+- [x] Insert opens the overlay.
+- [x] Insert closes the overlay.
+- [x] Mouse moves and clicks correctly inside the overlay.
 - [ ] Game does not react to menu clicks.
-- [ ] F1-F12 can be reassigned from Hotkeys.
+- [x] F1-F12 can be reassigned from Hotkeys.
 - [ ] Save persists settings after restart.
 - [ ] Reload restores INI values.
 - [ ] Reset Defaults restores F1-F5 mapping and all feature defaults.
@@ -346,7 +365,7 @@ Then verify:
 
 **Compilation:** PASS.
 
-**In-game validation:** awaiting first test.
+**In-game validation:** PASS — user confirmed V0.1 foundation works perfectly.
 
 **First successful build run:** `37231616133`.
 
@@ -356,3 +375,19 @@ Then verify:
 dxgi.dll                  513262d7212e4c4fe907ab83e8794704b8970dc2b1e97137b152fafd3abb16f6
 DarksidersGenesisMod.asi  ec9b951727edecbeef73c984068107c06d183d078370b412889bad402f73e1e5
 ```
+
+
+### V0.2
+
+- V0.1 becomes the validated overlay foundation.
+- Adds runtime menu-key rebinding from the General tab.
+- Default key remains Insert.
+- Escape cancels a pending key capture.
+- New binding is written immediately to `[Overlay] MenuKey`.
+- INI parser accepts named common keys, F1-F24, letters/numbers and `VK_XX` fallback tokens.
+- Reset Defaults restores Insert.
+- Menu title shows the current open/close key instead of hard-coding Insert.
+- Captured key is debounced to prevent instant menu closure on the capture press.
+- Gameplay features remain enabled by default and continue to be developed independently.
+
+**Validation:** awaiting V0.2 in-game test.
