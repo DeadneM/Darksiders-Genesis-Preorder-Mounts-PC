@@ -19,7 +19,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 namespace {
 
-constexpr const char* kBuild = "0.1.0-test";
+constexpr const char* kBuild = "0.2.0-test";
 constexpr const wchar_t* kIniName = L"DarksidersGenesisMod.ini";
 constexpr const wchar_t* kLogName = L"DarksidersGenesisMod.log";
 
@@ -42,6 +42,8 @@ WNDPROC g_originalWndProc = nullptr;
 
 std::atomic_bool g_imguiReady{false};
 std::atomic_bool g_overlayVisible{false};
+std::atomic_bool g_captureMenuKey{false};
+std::atomic_int g_capturedMenuKey{0};
 std::array<bool, 256> g_keyDown{};
 std::string g_lastAction = "None";
 
@@ -99,6 +101,132 @@ Action ParseAction(const wchar_t* text) {
         }
     }
     return Action::None;
+}
+
+bool IsExtendedVirtualKey(int vk) {
+    switch (vk) {
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_HOME:
+    case VK_END:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_LEFT:
+    case VK_RIGHT:
+    case VK_UP:
+    case VK_DOWN:
+    case VK_DIVIDE:
+    case VK_NUMLOCK:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::string KeyDisplayName(int vk) {
+    if (vk <= 0 || vk >= 256) {
+        return "Unbound";
+    }
+
+    UINT scan = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    LONG keyData = static_cast<LONG>(scan << 16);
+    if (IsExtendedVirtualKey(vk)) {
+        keyData |= (1 << 24);
+    }
+
+    char name[64]{};
+    if (GetKeyNameTextA(keyData, name, static_cast<int>(sizeof(name))) > 0) {
+        return name;
+    }
+
+    char fallback[16]{};
+    sprintf_s(fallback, sizeof(fallback), "VK_%02X", vk & 0xFF);
+    return fallback;
+}
+
+std::wstring KeyTokenFromVK(int vk) {
+    switch (vk) {
+    case VK_INSERT: return L"Insert";
+    case VK_DELETE: return L"Delete";
+    case VK_HOME: return L"Home";
+    case VK_END: return L"End";
+    case VK_PRIOR: return L"PageUp";
+    case VK_NEXT: return L"PageDown";
+    case VK_TAB: return L"Tab";
+    case VK_CAPITAL: return L"CapsLock";
+    case VK_PAUSE: return L"Pause";
+    case VK_SCROLL: return L"ScrollLock";
+    case VK_SPACE: return L"Space";
+    default:
+        break;
+    }
+
+    if (vk >= VK_F1 && vk <= VK_F24) {
+        wchar_t text[16]{};
+        swprintf_s(text, L"F%d", (vk - VK_F1) + 1);
+        return text;
+    }
+
+    if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z')) {
+        wchar_t text[2]{ static_cast<wchar_t>(vk), L'\0' };
+        return text;
+    }
+
+    wchar_t fallback[16]{};
+    swprintf_s(fallback, L"VK_%02X", vk & 0xFF);
+    return fallback;
+}
+
+int ParseKeyToken(const wchar_t* text, int fallback) {
+    if (!text || !*text) {
+        return fallback;
+    }
+
+    struct NamedKey { const wchar_t* name; int vk; };
+    constexpr NamedKey named[] = {
+        {L"Insert", VK_INSERT},
+        {L"Delete", VK_DELETE},
+        {L"Home", VK_HOME},
+        {L"End", VK_END},
+        {L"PageUp", VK_PRIOR},
+        {L"PageDown", VK_NEXT},
+        {L"Tab", VK_TAB},
+        {L"CapsLock", VK_CAPITAL},
+        {L"Pause", VK_PAUSE},
+        {L"ScrollLock", VK_SCROLL},
+        {L"Space", VK_SPACE}
+    };
+
+    for (const auto& entry : named) {
+        if (_wcsicmp(text, entry.name) == 0) {
+            return entry.vk;
+        }
+    }
+
+    if ((text[0] == L'F' || text[0] == L'f') && text[1]) {
+        const int n = _wtoi(text + 1);
+        if (n >= 1 && n <= 24) {
+            return VK_F1 + (n - 1);
+        }
+    }
+
+    if (text[0] && !text[1]) {
+        wchar_t ch = text[0];
+        if (ch >= L'a' && ch <= L'z') ch = static_cast<wchar_t>(ch - L'a' + L'A');
+        if ((ch >= L'0' && ch <= L'9') || (ch >= L'A' && ch <= L'Z')) {
+            return static_cast<int>(ch);
+        }
+    }
+
+    if ((_wcsnicmp(text, L"VK_", 3) == 0) && text[3]) {
+        wchar_t* end = nullptr;
+        const long value = wcstol(text + 3, &end, 16);
+        if (end != text + 3 && value > 0 && value < 256) {
+            return static_cast<int>(value);
+        }
+    }
+
+    return fallback;
 }
 
 void InitializePaths() {
@@ -168,6 +296,7 @@ void Log(const char* format, ...) {
 
 struct Config {
     bool overlayEnabled = true;
+    int menuKey = VK_INSERT;
 
     // Requested default policy: every planned feature is enabled by default.
     bool toggleHudEnabled = true;
@@ -213,6 +342,7 @@ struct Config {
 
     void ResetDefaults(bool save) {
         overlayEnabled = true;
+        menuKey = VK_INSERT;
         toggleHudEnabled = true;
         movementSpeedEnabled = true;
         actionRecoveryEnabled = true;
@@ -245,6 +375,10 @@ struct Config {
         }
 
         overlayEnabled = ReadBool(L"Overlay", L"Enabled", true, g_iniPath);
+
+        wchar_t menuKeyText[64]{};
+        GetPrivateProfileStringW(L"Overlay", L"MenuKey", L"Insert", menuKeyText, 64, g_iniPath.c_str());
+        menuKey = ParseKeyToken(menuKeyText, VK_INSERT);
 
         toggleHudEnabled = ReadBool(L"Features", L"ToggleHUD", true, g_iniPath);
         movementSpeedEnabled = ReadBool(L"Features", L"MovementSpeed", true, g_iniPath);
@@ -280,7 +414,8 @@ struct Config {
         }
 
         WriteBool(L"Overlay", L"Enabled", overlayEnabled, g_iniPath);
-        WritePrivateProfileStringW(L"Overlay", L"MenuKey", L"Insert", g_iniPath.c_str());
+        const std::wstring menuKeyToken = KeyTokenFromVK(menuKey);
+        WritePrivateProfileStringW(L"Overlay", L"MenuKey", menuKeyToken.c_str(), g_iniPath.c_str());
 
         WriteBool(L"Features", L"ToggleHUD", toggleHudEnabled, g_iniPath);
         WriteBool(L"Features", L"MovementSpeed", movementSpeedEnabled, g_iniPath);
@@ -353,10 +488,25 @@ void TriggerAction(Action action, int functionKey) {
 }
 
 void ProcessInput() {
-    if (KeyPressed(VK_INSERT) && g_config.overlayEnabled) {
+    const int capturedMenuKey = g_capturedMenuKey.exchange(0);
+    if (capturedMenuKey > 0 && capturedMenuKey < 256) {
+        g_config.menuKey = capturedMenuKey;
+        g_keyDown[static_cast<size_t>(capturedMenuKey)] = true;
+        g_config.Save();
+
+        const std::string keyName = KeyDisplayName(capturedMenuKey);
+        g_lastAction = std::string("Menu key rebound to ") + keyName;
+        Log("Menu key rebound to %s (VK=0x%02X)", keyName.c_str(), capturedMenuKey);
+    }
+
+    if (!g_captureMenuKey.load() &&
+        g_config.menuKey > 0 &&
+        g_config.menuKey < 256 &&
+        KeyPressed(g_config.menuKey) &&
+        g_config.overlayEnabled) {
         const bool newState = !g_overlayVisible.load();
         g_overlayVisible.store(newState);
-        Log("Overlay %s", newState ? "OPEN" : "CLOSED");
+        Log("Overlay %s by %s", newState ? "OPEN" : "CLOSED", KeyDisplayName(g_config.menuKey).c_str());
     }
 
     if (g_overlayVisible.load()) {
@@ -392,6 +542,22 @@ void ReleaseRenderTarget() {
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_imguiReady.load() && g_overlayVisible.load()) {
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+
+        if (g_captureMenuKey.load() && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)) {
+            const int vk = static_cast<int>(wParam & 0xFF);
+            if (vk == VK_ESCAPE) {
+                g_captureMenuKey.store(false);
+                g_lastAction = "Menu key rebind cancelled";
+                Log("Menu key rebind cancelled");
+                return TRUE;
+            }
+
+            if (vk > 0 && vk < 256) {
+                g_capturedMenuKey.store(vk);
+                g_captureMenuKey.store(false);
+                return TRUE;
+            }
+        }
 
         ImGuiIO& io = ImGui::GetIO();
         const bool mouseMessage =
@@ -540,7 +706,8 @@ void DrawOverlay() {
 
     ImGui::Text("ASI Overlay  v%s", kBuild);
     ImGui::SameLine();
-    ImGui::TextDisabled("| Insert to close");
+    const std::string menuKeyName = KeyDisplayName(g_config.menuKey);
+    ImGui::TextDisabled("| %s to close", menuKeyName.c_str());
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("MainTabs")) {
@@ -551,6 +718,18 @@ void DrawOverlay() {
             ImGui::BulletText("D3D11 Present hook: active");
             ImGui::BulletText("Mouse capture: active while menu is open");
             ImGui::BulletText("F1-F12 gameplay input: suppressed while menu is open");
+
+            ImGui::Spacing();
+            ImGui::Text("Menu");
+            ImGui::Text("Open / close key: %s", menuKeyName.c_str());
+            ImGui::SameLine(280.0f);
+            if (g_captureMenuKey.load()) {
+                ImGui::TextDisabled("Press a key...  Esc = cancel");
+            } else if (ImGui::Button("Rebind Menu Key", ImVec2(150.0f, 0.0f))) {
+                g_captureMenuKey.store(true);
+                g_lastAction = "Waiting for new menu key";
+                Log("Menu key capture started");
+            }
 
             ImGui::Spacing();
             ImGui::Text("Configuration");
@@ -572,8 +751,8 @@ void DrawOverlay() {
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextWrapped(
-                "V0.1 validates the loader, in-game overlay, mouse input, INI persistence "
-                "and configurable F1-F12 action map. Gameplay hooks are deliberately not "
+                "V0.2 keeps the validated V0.1 overlay foundation and adds a fully rebindable "
+                "menu key with immediate INI persistence. Gameplay hooks are deliberately not "
                 "pretended: each planned feature is enabled by default but marked pending "
                 "until its game-native implementation is verified."
             );
