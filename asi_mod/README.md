@@ -446,6 +446,17 @@ Goal:
 
 Status: **pending mount movement/sprint audit**.
 
+### 9B. Horse Dash / Sprint Duration
+
+Goal:
+
+- increase how long the horse dash/sprint can remain active;
+- keep duration separate from horse speed;
+- expose an adjustable duration multiplier if the native mount ability supports it;
+- preserve stamina/cooldown behavior unless explicitly tuned by a later feature.
+
+Status: **pending horse dash/sprint ability audit**.
+
 ### 10. FOV
 
 Goal:
@@ -811,3 +822,19 @@ For validation, test **2.00x** first so the effect is unmistakable.
 Action Recovery from V0.5A is preserved unchanged.
 
 **Validation:** awaiting V0.5B in-game test.
+
+
+### Recovery audit note — MoveInterruptDelaySec
+
+The previous V0.5A interpretation of `MoveInterruptDelaySec` as the player's
+post-dodge movement lock is rejected.
+
+Current hypothesis:
+
+- it may instead participate in hit reaction / stun / interruption recovery;
+- it remains a valid field to investigate for a future **stun / hit recovery**
+  feature;
+- it must not be reused for dodge recovery without runtime proof.
+
+Dodge recovery investigation is now focused on the dedicated Mayhem dash ability
+state and its movement-input lock instead.
